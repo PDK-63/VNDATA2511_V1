@@ -1,0 +1,20 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.portWin": "COM16",
+  "idf.currentSetup": "D:/Tai_lieu/ESP32_Project_VSCODE/Espressif/frameworks/esp-idf-v5.3.1/",
+  "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20230419/openocd-esp32/share/openocd/scripts",
+    "IDF_CCACHE_ENABLE": "1",
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "D:\\Tai_lieu\\ESP32_Project_VSCODE\\Espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Tai_lieu\\ESP32_Project_VSCODE\\Learn\\VNDATA2511_V1\\build"
+  ],
+  "idf.flashType": "UART"
+}

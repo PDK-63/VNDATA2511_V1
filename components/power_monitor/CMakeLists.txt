@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "src/power_monitor.c"
+        "src/adc_service.c"
+        "src/event_bus.c"
+        "src/net_stub.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_adc
+        driver
+        esp_timer
+)
