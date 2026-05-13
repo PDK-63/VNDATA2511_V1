@@ -51,16 +51,26 @@ SMS Có điện trở lại: CANH BAO - ID Thiết bị; Nguồn chính (M
 Ví dụ: ""Thong Bao - Thiet Bi: 2510ABC123; Co Dien Tro Lai; -10.00; 50%; (04h00 21/01/2026)."""						
 								
 Một số lưu ý							
-Lưu ý 1	Bộ điều khiển sẽ ưu tiên sử dụng wifi, khi mất tín hiệu wifi sẽ tự động chuyển sang 4G, khi có wifi sẽ tự động kết nối lại						
-Lưu ý 3	Nguồn cấp từ 7-30VDC						
-Lưu ý 4	Tbi thông báo qua SMS (tên thiết bị sẽ lấy tên theo cài đặt trên web)						
-Lưu ý 5	Trong phần cài đặt SĐT cảnh báo SMS, Gọi điện. Nếu để SĐT là "00" thì không gửi đến số đó.						
-Lưu ý 6	Ưu tiên sử dụng nguồn chính, khi mất nguồn chính tự động chuyển nguồn phụ, khi có nguồn chính tự động chuyển lại.						
+Lưu ý 1	Bộ điều khiển sẽ ưu tiên sử dụng wifi, khi mất tín hiệu wifi sẽ tự động chuyển sang 4G, khi có wifi sẽ tự động kết nối lại		
+
+Lưu ý 3	Nguồn cấp từ 7-30VDC				
+
+Lưu ý 4	Tbi thông báo qua SMS (tên thiết bị sẽ lấy tên theo cài đặt trên web)	
+
+Lưu ý 5	Trong phần cài đặt SĐT cảnh báo SMS, Gọi điện. Nếu để SĐT là "00" thì không gửi đến số đó.	
+
+Lưu ý 6	Ưu tiên sử dụng nguồn chính, khi mất nguồn chính tự động chuyển nguồn phụ, khi có nguồn chính tự động chuyển lại.		
+
 Lưu ý 7	Nguồn chính và phụ sử dụng Jack cắm DC cái						
-Lưu ý 8	Thêm công tắc tắt còi (Màu đen) ---> Chuyển sang Reset tắt còi						
-Lưu ý 9	Switch để kích hoạt: Nhiệt độ, Độ ẩm, GPS, Spare (03, 01 dự phòng)  Chuyển sang giao diện web						
+
+Lưu ý 8	Thêm công tắc tắt còi (Màu đen) ---> Chuyển sang Reset tắt còi					
+
+Lưu ý 9	Switch để kích hoạt: Nhiệt độ, Độ ẩm, GPS, Spare (03, 01 dự phòng)  Chuyển sang giao diện web		
+
 Lưu ý 10	Chú ý lỗi đứt dây cảm biến						
-Lưu ý 12	Việc báo động Call, SMS cần kết thúc trong vòng 2 phút.						
+
+Lưu ý 12	Việc báo động Call, SMS cần kết thúc trong vòng 2 phút.					
+
 Lưu ý 13	"Khi nguồn chính mất, Thiết bị sử dụng nguồn phụ khi nguồn phụ sắp hết điện thì gửi sms thông báo cuối, và dừng các hoạt động lại.
 
 Cú pháp: ID Thiết bị; Nguon Phu Pin Yeu; Nhiệt độ hiện tại; Độ ẩm hiện tại; Thời gian.
