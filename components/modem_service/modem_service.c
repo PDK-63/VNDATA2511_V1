@@ -749,62 +749,6 @@ static void trim_ascii(char *s)
     if (start != s) memmove(s, start, end - start + 1);
 }
 
-// static bool modem_sms_ready(void)
-// {
-//     char resp[128] = {0};
-//     bool sim_ready = false;
-//     bool reg_ready = false;
-
-//     if (!s_dce) {
-//         return false;
-//     }
-
-//     if (modem_at_cmd("AT+CPIN?", resp, sizeof(resp), 3000) == ESP_OK) {
-//         sim_ready = (strstr(resp, "READY") != NULL);
-//         ESP_LOGI(TAG, "CPIN resp: %s", resp);
-//     } else {
-//         ESP_LOGW(TAG, "AT+CPIN? failed");
-//         return false;
-//     }
-
-//     memset(resp, 0, sizeof(resp));
-//     if (modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 3000) == ESP_OK) {
-//         int n = 0, stat = 0;
-//         if (sscanf(resp, "%*[^:]: %d,%d", &n, &stat) == 2) {
-//             reg_ready = (stat == 1 || stat == 5);
-//         }
-//         ESP_LOGI(TAG, "CEREG resp: %s", resp);
-//     }
-
-//     if (!reg_ready) {
-//         memset(resp, 0, sizeof(resp));
-//         if (modem_at_cmd("AT+CREG?", resp, sizeof(resp), 3000) == ESP_OK) {
-//             int n = 0, stat = 0;
-//             if (sscanf(resp, "%*[^:]: %d,%d", &n, &stat) == 2) {
-//                 reg_ready = (stat == 1 || stat == 5);
-//             }
-//             ESP_LOGI(TAG, "CREG resp: %s", resp);
-//         }
-//     }
-
-//     if (!sim_ready) {
-//         ESP_LOGW(TAG, "SMS not ready: SIM not ready");
-//         return false;
-//     }
-
-//     if (!reg_ready) {
-//         ESP_LOGW(TAG, "SMS not ready: network not registered");
-//         return false;
-//     }
-
-//     memset(resp, 0, sizeof(resp));
-//     if (modem_at_cmd("AT+CMGF=1", resp, sizeof(resp), 3000) != ESP_OK) {
-//         ESP_LOGW(TAG, "AT+CMGF=1 failed");
-//         return false;
-//     }
-
-//     return true;
-// }
 static bool modem_sms_ready(void)
 {
     char resp[128] = {0};
@@ -916,6 +860,16 @@ esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *t
         goto out;
     }
 
+    memset(resp, 0, sizeof(s_sms_resp_buf));
+    err = modem_at_cmd("AT+CMGF=1", resp, sizeof(s_sms_resp_buf), 3000);
+    ESP_LOGI(TAG, "CMGF=1 result=%s resp=[%s]", esp_err_to_name(err), resp);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set SMS text mode failed before poll: %s", esp_err_to_name(err));
+        err = ESP_OK;
+        goto out;
+    }
+
     uart_flush_input(s_cfg.uart_port);
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -960,10 +914,11 @@ esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *t
     }
 
     if (used == 0) {
+        ESP_LOGW(TAG, "CMGL ALL raw resp empty");
         err = ESP_OK;
         goto out;
     }
-
+    ESP_LOGW(TAG, "CMGL ALL raw resp: [%s]", resp);
     char *p = resp;
     while ((p = strstr(p, "+CMGL:")) != NULL) {
         int index = -1;

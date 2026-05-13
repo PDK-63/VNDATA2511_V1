@@ -170,13 +170,13 @@ static void publish_get_config_response(const char *request_id, const runtime_co
                      cfg->broker_uri,
                      cfg->mqtt_username,
                      cfg->mqtt_password,
-                     cfg->alarm_number1,
                      cfg->alarm_number2,
                      cfg->alarm_number3,
                      cfg->alarm_number4,
                      cfg->alarm_number5,
-                     cfg->message,
                      cfg->alarm_number6,
+                     cfg->message,
+                     cfg->alarm_number1,
                      cfg->ntc_high_limit_c,
                      cfg->ntc_low_limit_c,
                      cfg->hum_high_limit_pct,
@@ -231,13 +231,14 @@ static void handle_set_config(const app_cloud_cmd_t *cmd)
     }
     json_get_string(root, "wifipass", cfg.wifi_pass, sizeof(cfg.wifi_pass));
 
-    json_get_string(root, "sms1", cfg.alarm_number1, sizeof(cfg.alarm_number1));
-    json_get_string(root, "sms2", cfg.alarm_number2, sizeof(cfg.alarm_number2));
-    json_get_string(root, "sms3", cfg.alarm_number3, sizeof(cfg.alarm_number3));
-    json_get_string(root, "sms4", cfg.alarm_number4, sizeof(cfg.alarm_number4));
-    json_get_string(root, "sms5", cfg.alarm_number5, sizeof(cfg.alarm_number5));
+    json_get_string(root, "phone1", cfg.alarm_number1, sizeof(cfg.alarm_number1));
+    json_get_string(root, "sms1", cfg.alarm_number2, sizeof(cfg.alarm_number2));
+    json_get_string(root, "sms2", cfg.alarm_number3, sizeof(cfg.alarm_number3));
+    json_get_string(root, "sms3", cfg.alarm_number4, sizeof(cfg.alarm_number4));
+    json_get_string(root, "sms4", cfg.alarm_number5, sizeof(cfg.alarm_number5));
+    json_get_string(root, "sms5", cfg.alarm_number6, sizeof(cfg.alarm_number6));
+
     json_get_string(root, "message", cfg.message, sizeof(cfg.message));
-    json_get_string(root, "phone1", cfg.alarm_number6, sizeof(cfg.alarm_number6));
 
     json_get_float(root, "ahi", &cfg.ntc_high_limit_c);
     json_get_float(root, "alo", &cfg.ntc_low_limit_c);
@@ -246,7 +247,7 @@ static void handle_set_config(const app_cloud_cmd_t *cmd)
 
     json_get_string(root, "apn", cfg.apn, sizeof(cfg.apn));
     json_get_bool(root, "gps", &cfg.gps_enabled);
-
+    
     cJSON_Delete(root);
 
     bool wifi_changed = wifi_config_changed(&old_cfg, &cfg);

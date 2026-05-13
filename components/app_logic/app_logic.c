@@ -841,8 +841,10 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
     }
 
     if (id == APP_EVENT_CLOUD_COMMAND) {
-        if (data && s_cloud_cmd_queue) {
-            if (xQueueSend(s_cloud_cmd_queue, data, 0) != pdTRUE) {
+        if (data && s_cloud_cmd_queue) 
+        {
+            if (xQueueSend(s_cloud_cmd_queue, data, 0) != pdTRUE) 
+            {
                 ESP_LOGW(TAG, "cloud cmd queue full");
             }
         }
@@ -852,19 +854,35 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         publish_state_internal("mqtt_connected");
     } else if (id == APP_EVENT_MQTT_DISCONNECTED) {
         tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
-    } 
-    else if (id == APP_EVENT_NET_UP) {
+    }  
+    else if (id == APP_EVENT_NET_UP) 
+    {
         app_net_status_t *st = (app_net_status_t *)data;
+
         if (st) {
             s_net_type = st->type;
-            s_uplink_ready = (st->type == APP_NET_WIFI || st->type == APP_NET_PPP) && st->has_ip;
 
-            // if (st->type == APP_NET_PPP && st->has_ip) {
-            //     sim_led_set_state(SIM_LED_STATE_READY);
-            // }
+            if ((st->type == APP_NET_ETH ||
+                st->type == APP_NET_WIFI ||
+                st->type == APP_NET_PPP) &&
+                st->has_ip) {
+
+                s_uplink_ready = true;
+                time_sync_start();
+
+                ESP_LOGI(TAG, "uplink ready: net=%s",
+                        net_type_to_str_internal(s_net_type));
+            } else {
+                s_uplink_ready = false;
+
+                ESP_LOGW(TAG, "net up ignored: type=%d has_ip=%d",
+                        st->type,
+                        st->has_ip ? 1 : 0);
+            }
         }
-    } 
-    else if (id == APP_EVENT_NET_DOWN) {
+    }
+    else if (id == APP_EVENT_NET_DOWN) 
+    {
         app_net_status_t *st = (app_net_status_t *)data;
         if (st && st->type == s_net_type) {
             s_uplink_ready = false;
@@ -874,43 +892,9 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
             s_net_type = APP_NET_NONE;
         }
 
-        // if (!st || st->type == APP_NET_PPP) {
-        //     sim_led_set_state(SIM_LED_STATE_OFF);
-        // }
-
         tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
     }
-    // else if (id == APP_EVENT_NET_UP) {
-    //     app_net_status_t *st = (app_net_status_t *)data;
-    //     if (st) {
-    //         s_net_type = st->type;
 
-    //         s_uplink_ready = (st->type == APP_NET_ETH ||
-    //               st->type == APP_NET_WIFI ||
-    //               st->type == APP_NET_PPP) && st->has_ip;
-
-    //         if ((st->type == APP_NET_ETH ||
-    //             st->type == APP_NET_WIFI ||
-    //             st->type == APP_NET_PPP) && st->has_ip) {
-    //             time_sync_start();
-    //         }
-    //     }
-    // }
-    // else if (id == APP_EVENT_NET_DOWN) {
-    //     app_net_status_t *st = (app_net_status_t *)data;
-
-    //     if (st) {
-    //         if (st->type == s_net_type) {
-    //             s_uplink_ready = false;
-    //             s_net_type = APP_NET_NONE;
-    //             tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
-    //         }
-    //     } else {
-    //         s_uplink_ready = false;
-    //         s_net_type = APP_NET_NONE;
-    //         tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
-    //     }
-    // }
 }
 
 static bool is_temp_low_trigger_now_internal(void)
@@ -1747,21 +1731,12 @@ static void process_alarm_logic(void)
                 s_alarm_assert_start_ms = 0;
                 s_alarm_restore_start_ms = 0;
 
-                /* RELAY ON KHI CO ALARM */
-                // board_tca_write_pin(APP_DO1_TCA_PIN, true);
-                // if (s_display_ready) {
-                //     tm1638_set_led(&s_tm1638, 3, true);
-                // }
                 update_do1_output_state();
 
                 s_alarm_sms_pending = true;
                 s_alarm_sms_sent = false;
                 s_last_sms_try_ms = 0;
 
-                // s_alarm_call_pending = true;
-                // s_alarm_call_done = false;
-                // s_last_call_try_ms = 0;
-                //arm_alarm_call_request();
                 uint8_t call_count = 0;
                 if (temp_alarm_now) {
                     call_count++;
@@ -1779,8 +1754,6 @@ static void process_alarm_logic(void)
                 s_alarm_restored_call_done = true;
                 s_last_alarm_restored_call_try_ms = 0;
 
-                // s_alarm_last_notify_ms = now_ms;
-                // s_alarm_notify_count = 1;
                 if (temp_alarm_now) {
                     s_temp_alarm_last_notify_ms = now_ms;
                     s_temp_alarm_notify_count = 1;
@@ -2003,7 +1976,6 @@ static void process_alarm_restored_call(void)
         ESP_LOGW(TAG, "queued alarm restored call to number1");
     }
 }
-
 
 static void process_alarm_reminder(void)
 {
@@ -2530,28 +2502,54 @@ static void sample_sensors(void)
                         s_sht_restore_confirm_count++;
                     }
 
+                    // if (s_sht_restore_confirm_count >= APP_SHT_RESTORE_CONFIRM_COUNT) {
+                    //     s_sht_fault_confirmed = false;
+                    //     s_sht_restore_confirm_count = 0;
+
+                    //     if (s_sht_fault_sms_sent_once) {
+                    //         s_sht_restored_sms_pending = true;
+                    //         s_sht_restored_sms_sent = false;
+                    //         s_last_sht_restored_sms_try_ms = 0;
+                    //         s_sht_restored_sms_job_queued = false;
+
+                    //         s_sht_fault_sms_pending = false;
+                    //         s_sht_fault_sms_sent = false;
+                    //         s_last_sht_fault_sms_try_ms = 0;
+                    //         s_sht_fault_sms_job_queued = false;
+
+                    //         ESP_LOGW(TAG, "SHT30 restored confirmed -> queue SMS only");
+                    //     } else {
+                    //         s_sht_restored_sms_pending = false;
+                    //         s_sht_restored_sms_sent = false;
+                    //         s_last_sht_restored_sms_try_ms = 0;
+                    //         s_sht_restored_sms_job_queued = false;
+                    //     }
+                    // }
                     if (s_sht_restore_confirm_count >= APP_SHT_RESTORE_CONFIRM_COUNT) {
                         s_sht_fault_confirmed = false;
                         s_sht_restore_confirm_count = 0;
 
-                        if (s_sht_fault_sms_sent_once) {
-                            s_sht_restored_sms_pending = true;
-                            s_sht_restored_sms_sent = false;
-                            s_last_sht_restored_sms_try_ms = 0;
-                            s_sht_restored_sms_job_queued = false;
+                        /*
+                        * Da xac nhan SHT30 fault truoc do.
+                        * Khi SHT30 doc OK du so lan restore confirm,
+                        * thi queue SMS restored.
+                        *
+                        * Khong phu thuoc tuyet doi vao s_sht_fault_sms_sent_once,
+                        * vi co truong hop SMS fault da queue/gui cham, hoac flag chua kip cap nhat.
+                        */
+                        s_sht_restored_sms_pending = true;
+                        s_sht_restored_sms_sent = false;
+                        s_last_sht_restored_sms_try_ms = 0;
+                        s_sht_restored_sms_job_queued = false;
 
-                            s_sht_fault_sms_pending = false;
-                            s_sht_fault_sms_sent = false;
-                            s_last_sht_fault_sms_try_ms = 0;
-                            s_sht_fault_sms_job_queued = false;
+                        s_sht_fault_sms_pending = false;
+                        s_sht_fault_sms_sent = false;
+                        s_last_sht_fault_sms_try_ms = 0;
+                        s_sht_fault_sms_job_queued = false;
 
-                            ESP_LOGW(TAG, "SHT30 restored confirmed -> queue SMS only");
-                        } else {
-                            s_sht_restored_sms_pending = false;
-                            s_sht_restored_sms_sent = false;
-                            s_last_sht_restored_sms_try_ms = 0;
-                            s_sht_restored_sms_job_queued = false;
-                        }
+                        ESP_LOGW(TAG,
+                                "SHT30 restored confirmed -> queue SMS restored, sent_once=%d",
+                                s_sht_fault_sms_sent_once ? 1 : 0);
                     }
                 } else {
                     s_sht_restore_confirm_count = 0;
@@ -2868,13 +2866,23 @@ static void modem_task(void *arg)
         }
 
         case MODEM_JOB_POLL_INBOX: {
-            char sender[32];
-            char body[192];
-            char reply[256];
+            char sender[32] = {0};
+            char body[192] = {0};
+            char reply[256] = {0};
             bool found = false;
 
+            ESP_LOGW(TAG, "POLL_INBOX_START");
+
             esp_err_t err = modem_service_poll_unread_sms(sender, sizeof(sender),
-                                                          body, sizeof(body), &found);
+                                                        body, sizeof(body), &found);
+
+            ESP_LOGW(TAG,
+                    "POLL_INBOX_RESULT: err=%s found=%d sender=[%s] body=[%s]",
+                    esp_err_to_name(err),
+                    found ? 1 : 0,
+                    sender,
+                    body);
+
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "poll unread sms failed: %s", esp_err_to_name(err));
                 break;
@@ -2886,27 +2894,40 @@ static void modem_task(void *arg)
 
             ESP_LOGI(TAG, "incoming sms from=%s body=%s", sender, body);
 
-            if (sms_command_text_equals_ci(body, "TT") || sms_command_text_equals_ci(body, "INFOR")) {
+            if (sms_command_text_equals_ci(body, "TT") ||
+                sms_command_text_equals_ci(body, "INFOR")) {
+
                 sms_command_format_status(reply, sizeof(reply));
-                modem_service_send_sms(sender, reply);
+
+                esp_err_t send_err = modem_service_send_sms(sender, reply);
+                ESP_LOGW(TAG, "TT_REPLY_SEND: %s", esp_err_to_name(send_err));
+
             } else if (sms_command_text_equals_ci(body, "2511;ENG_INFOR")) {
+
                 sms_command_format_eng_info(reply, sizeof(reply));
-                modem_service_send_sms(sender, reply);
+
+                esp_err_t send_err = modem_service_send_sms(sender, reply);
+                ESP_LOGW(TAG, "ENG_REPLY_SEND: %s", esp_err_to_name(send_err));
+
             } else if (sms_command_text_equals_ci(body, "2511;RESET")) {
-                modem_service_send_sms(sender, "RESET OK, REBOOT");
+
+                esp_err_t send_err = modem_service_send_sms(sender, "RESET OK, REBOOT");
+                ESP_LOGW(TAG, "RESET_REPLY_SEND: %s", esp_err_to_name(send_err));
+
                 vTaskDelay(pdMS_TO_TICKS(1500));
                 handle_reboot_request_internal();
+
             } else if (strncmp(body, "2511;", 5) == 0) {
+
                 esp_err_t set_err = sms_command_process_set(sender, body);
-                if (set_err != ESP_OK && set_err != ESP_ERR_NOT_FOUND) {
-                    ESP_LOGW(TAG, "process set sms failed: %s", esp_err_to_name(set_err));
-                }
+                ESP_LOGW(TAG, "SET_SMS_PROCESS: %s", esp_err_to_name(set_err));
+
             } else {
                 ESP_LOGI(TAG, "ignore sms command body=%s", body);
             }
+
             break;
         }
-
         default:
             ESP_LOGW(TAG, "unknown modem job=%d", (int)job.type);
             break;
@@ -2925,25 +2946,16 @@ static void process_incoming_sms_commands(void)
     }
 
     if (s_modem_busy) {
+        ESP_LOGW(TAG, "SMS_POLL_SKIP: modem_busy=1");
         return;
     }
 
-    /* Uu tien alarm/power/fault truoc, khong poll inbox khi dang co viec khan */
-    if (s_alarm_sms_pending ||
-        s_alarm_call_pending ||
-        s_alarm_restored_sms_pending ||
-        s_power_lost_sms_pending ||
-        s_power_lost_call_pending ||
-        s_power_restored_sms_pending ||
-        s_ntc_fault_sms_pending ||
-        s_ntc_restored_sms_pending ||
-        s_sht_fault_sms_pending ||
-        s_sht_restored_sms_pending) {
-        return;
+    if (enqueue_modem_job(MODEM_JOB_POLL_INBOX)) {
+        s_last_sms_command_poll_ms = now_ms;
+        ESP_LOGW(TAG, "SMS_POLL_QUEUED");
+    } else {
+        ESP_LOGE(TAG, "SMS_POLL_QUEUE_FAILED");
     }
-
-    s_last_sms_command_poll_ms = now_ms;
-    enqueue_modem_job(MODEM_JOB_POLL_INBOX);
 }
 
 static void publish_task(void *arg)
@@ -2979,7 +2991,10 @@ static void publish_task(void *arg)
 
         if ((now - last_sensor) >= pdMS_TO_TICKS(APP_SENSOR_SAMPLE_MS)) {
             sample_sensors();
-            if (s_ntc1_valid && (!s_runtime_cfg.hum_enabled || s_humidity_valid)) {
+            // if (s_ntc1_valid && (!s_runtime_cfg.hum_enabled || s_humidity_valid)) {
+            //     s_boot_sensor_ready = true;
+            // }
+            if (s_ntc1_valid) {
                 s_boot_sensor_ready = true;
             }
             if (!s_power_boot_checked) {
@@ -3014,7 +3029,6 @@ static void publish_task(void *arg)
             process_alarm_reminder();
             process_alarm_sms();
             process_alarm_restored_sms();
-            //process_alarm_reminder();
 
             process_power_lost_sms();
             process_power_restored_sms();

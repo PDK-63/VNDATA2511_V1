@@ -98,6 +98,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     static const char html_suffix[] =
         "' readonly>"
         "<button type='submit'>Save</button>"
+         "<div style='text-align:center;margin-top:18px;font-size:13px;color:#777;'>Power by VTGTechnology</div>"
         "</form></div></body></html>";
 
     const char *device_id = mqtt_service_get_device_key();

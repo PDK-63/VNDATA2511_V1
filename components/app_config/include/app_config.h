@@ -83,7 +83,7 @@
 #define APP_OTA_URL_DEFAULT              ""
 
 /* Wi-Fi provisioning / AP */
-#define APP_WIFI_AP_SSID                 "VN2411_SETUP"
+#define APP_WIFI_AP_SSID                 "VN2511_SETUP"
 #define APP_WIFI_AP_PASS                 "12345678"
 #define APP_WIFI_AP_CHANNEL              1
 #define APP_WIFI_AP_MAX_CONN             4
@@ -145,3 +145,4 @@
 #define APP_SDMMC_BUS_WIDTH               1
 
 #define APP_SD_LOG_INTERVAL_MS            (5 * 60 * 1000)
+
