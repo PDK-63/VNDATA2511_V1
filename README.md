@@ -1,15 +1,4 @@
-Cấu hình phần cứng thiết bị (Bản 2510 Pro mã 2511)							
-01 đầu cảm biến (NTC 10K):	- Kết nối hệ thống						
-01 cảm biến độ ẩm	- Sử dụng I2C						
-01 Module RS485 (Modbus RTU)	- Sử dụng cho nhiều cảm biến và kết nối với hệ thống ngoại vi trong tương lai						
-03 Input: (03 như cũ)	- Để chờ, đấu tín hiệu báo động						
-02 Output:	- 01 Relay cảnh báo, 01 Relay cho còi (báo động khi bị mất điện)						
-01 Wifi	- Kết nối với Server						
-01 Lan (RJ45)	- Kết nối với Server						
-01 Module 4G	- Gửi tin nhắn và gọi điện cảnh báo, Gửi dữ liệu lên Server						
-01 Module GNSS	- Gửi tọa độ vị trí						
-							
-Chức năng của phần cứng							
+											
 Chức năng 1	- Đẩy dữ liệu nhiệt độ, độ ẩm, tọa độ lên Server						
 Chức năng 2	- Đẩy tín hiệu InOut lên Server						
 Chức năng 4	- Báo động thông qua tin nhắn SMS (05 Số)						
