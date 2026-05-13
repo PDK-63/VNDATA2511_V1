@@ -1,9 +1,14 @@
 											
-Chức năng 1	- Đẩy dữ liệu nhiệt độ, độ ẩm, tọa độ lên Server						
-Chức năng 2	- Đẩy tín hiệu InOut lên Server						
-Chức năng 4	- Báo động thông qua tin nhắn SMS (05 Số)						
-Chức năng 5	- Báo động thông qua cuộc gọi (01 Số hoặc 05 số do người dùng chọn)						
-Chức năng 6	- Hệ thống cảnh báo bộ điều khiển quá nhiệt (Sẽ gửi tín hiệu SMS cảnh báo cuối và tự ngắt thiết bị)						
+Chức năng 1	- Đẩy dữ liệu nhiệt độ, độ ẩm, tọa độ lên Server
+
+Chức năng 2	- Đẩy tín hiệu InOut lên Server	
+
+Chức năng 4	- Báo động thông qua tin nhắn SMS (05 Số)		
+
+Chức năng 5	- Báo động thông qua cuộc gọi (01 Số hoặc 05 số do người dùng chọn)		
+
+Chức năng 6	- Hệ thống cảnh báo bộ điều khiển quá nhiệt (Sẽ gửi tín hiệu SMS cảnh báo cuối và tự ngắt thiết bị)			
+
 Chức năng 7	"- Vượt ngưỡng nhiệt độ cao, thấp (NTC)
   1. Khi tbi vượt ngưỡng nhiệt độ cao: Báo động qua SMS (05 SĐT), Báo động qua gọi điện (05 SĐT), Còi ON, Output 1 ON.
   2. Khi tbi vượt ngưỡng nhiệt độ thấp: Báo động qua SMS (05 SĐT), Báo động qua gọi điện (05 SĐT), Còi ON, Output 1 ON.
