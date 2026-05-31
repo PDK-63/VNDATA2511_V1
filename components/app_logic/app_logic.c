@@ -58,6 +58,9 @@ static void handle_cmd_topic_cloud_command(const app_cloud_cmd_t *cmd);
 static void reply_current_state_internal(const char *request_id, bool ok, const char *extra);
 static void handle_reboot_request_internal(void);
 static bool s_boot_sensor_ready = false;
+#define APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS   60000UL
+static uint8_t s_sms_modem_not_ready_fast_try = 0;
+
 typedef enum {
     MODEM_JOB_NONE = 0,
     MODEM_JOB_SMS_TEMP_ALARM,
@@ -372,8 +375,85 @@ static TickType_t s_last_rtc_sync_check = 0;
 #define APP_TM1638_BRIGHTNESS_MAIN_OK    7
 #define APP_TM1638_BRIGHTNESS_MAIN_LOST  1
 static uint8_t s_last_display_brightness = 0xFF;
+static int64_t s_modem_busy_since_ms = 0;
+static int64_t s_last_mqtt_connected_ms = 0;
+
+
+#define APP_TELEMETRY_QUEUE_MAX          120
+#define APP_TELEMETRY_PAYLOAD_MAX        640
+#define APP_TELEMETRY_FLUSH_MAX_PER_LOOP 3
+
+typedef struct {
+    char payload[APP_TELEMETRY_PAYLOAD_MAX];
+} telemetry_queue_item_t;
+
+static telemetry_queue_item_t s_telemetry_queue[APP_TELEMETRY_QUEUE_MAX];
+static uint16_t s_telemetry_q_head = 0;
+static uint16_t s_telemetry_q_count = 0;
 
 void app_logic_handle_hum_disabled(void);
+
+static void telemetry_queue_push(const char *payload)
+{
+    if (!payload || payload[0] == '\0') {
+        return;
+    }
+
+    uint16_t idx;
+
+    if (s_telemetry_q_count >= APP_TELEMETRY_QUEUE_MAX) {
+        /*
+         * Queue day -> bo ban ghi cu nhat.
+         */
+        s_telemetry_q_head =
+            (s_telemetry_q_head + 1) % APP_TELEMETRY_QUEUE_MAX;
+        s_telemetry_q_count = APP_TELEMETRY_QUEUE_MAX - 1;
+
+        ESP_LOGW(TAG, "telemetry queue full -> drop oldest");
+    }
+
+    idx = (s_telemetry_q_head + s_telemetry_q_count) %
+          APP_TELEMETRY_QUEUE_MAX;
+
+    snprintf(s_telemetry_queue[idx].payload,
+             sizeof(s_telemetry_queue[idx].payload),
+             "%s",
+             payload);
+
+    s_telemetry_q_count++;
+
+    ESP_LOGW(TAG, "telemetry queued count=%u", (unsigned)s_telemetry_q_count);
+}
+
+static void telemetry_queue_flush_some(void)
+{
+    if (!s_uplink_ready || !mqtt_service_is_connected()) {
+        return;
+    }
+
+    uint8_t sent = 0;
+
+    while (s_telemetry_q_count > 0 &&
+           sent < APP_TELEMETRY_FLUSH_MAX_PER_LOOP) {
+
+        telemetry_queue_item_t *item =
+            &s_telemetry_queue[s_telemetry_q_head];
+
+        int mid = mqtt_service_publish_telemetry(item->payload);
+
+        ESP_LOGI(TAG,
+                 "telemetry flush mid=%d remain_before=%u payload=%s",
+                 mid,
+                 (unsigned)s_telemetry_q_count,
+                 item->payload);
+
+        s_telemetry_q_head =
+            (s_telemetry_q_head + 1) % APP_TELEMETRY_QUEUE_MAX;
+
+        s_telemetry_q_count--;
+        sent++;
+    }
+}
 
 static void arm_alarm_call_requests(uint8_t count)
 {
@@ -786,9 +866,30 @@ static void publish_sensor_fault_event(const char *sensor,
     ESP_LOGW(TAG, "sensor event mid=%d payload=%s", mid, payload);
 }
 
+// static void process_sensor_fault_notifications(void)
+// {
+//     if (!s_uplink_ready || !mqtt_service_is_connected()) {
+//         return;
+//     }
+
+//     if (s_ntc_fault_notify_pending) {
+//         publish_sensor_fault_event("ntc", s_ntc_fault_active, s_ntc_fault_reason);
+//         s_ntc_fault_notify_pending = false;
+//     }
+
+//     if (s_sht_fault_notify_pending) {
+//         publish_sensor_fault_event("sht30", s_sht_fault_active, s_sht_fault_reason);
+//         s_sht_fault_notify_pending = false;
+//     }
+// }
+
 static void process_sensor_fault_notifications(void)
 {
     if (!s_uplink_ready || !mqtt_service_is_connected()) {
+        return;
+    }
+
+    if (s_modem_busy || modem_service_is_cs_session_active()) {
         return;
     }
 
@@ -850,10 +951,22 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         }
     }
     else if (id == APP_EVENT_MQTT_CONNECTED) {
+        s_last_mqtt_connected_ms = esp_timer_get_time() / 1000;
         tm1638_server_set_state(SERVER_LED_CONNECTED);
         publish_state_internal("mqtt_connected");
+          telemetry_queue_flush_some();
     } else if (id == APP_EVENT_MQTT_DISCONNECTED) {
-        tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        //tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+         bool mqtt_down_for_cs =
+            (s_net_type == APP_NET_PPP) &&
+            (modem_service_is_cs_session_active() ||
+            !modem_service_should_auto_restart_ppp());
+
+        if (mqtt_down_for_cs) {
+            ESP_LOGI(TAG, "MQTT disconnected during PPP CS -> keep server LED state");
+        } else {
+            tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        }
     }  
     else if (id == APP_EVENT_NET_UP) 
     {
@@ -883,16 +996,66 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
     }
     else if (id == APP_EVENT_NET_DOWN) 
     {
+        // app_net_status_t *st = (app_net_status_t *)data;
+        // bool active_link_down = false;
+        //  /*
+        // * Neu PPP bi down do modem dang vao CS session de poll/gui SMS,
+        // * thi day la gian doan chu dong, khong bao LED server loi.
+        // */
+        // bool ppp_down_for_cs =
+        //     st &&
+        //     st->type == APP_NET_PPP &&
+        //     modem_service_is_cs_session_active();
+
+        // if (st && st->type == s_net_type) {
+        //     active_link_down = true;
+        //     s_uplink_ready = false;
+        // }
+        // if (!st) {
+        //      active_link_down = true;
+        //     s_uplink_ready = false;
+        //     s_net_type = APP_NET_NONE;
+        // }
+
+        // if (mqtt_service_is_connected()) {
+        //     tm1638_server_set_state(SERVER_LED_CONNECTED);
+        // } else if (active_link_down || !s_uplink_ready) {
+        //     tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        // }
+        // else if (active_link_down || !s_uplink_ready) {
+        //     tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        // }
         app_net_status_t *st = (app_net_status_t *)data;
+        bool active_link_down = false;
+
+        /*
+        * Neu PPP bi down do modem dang vao CS session de poll/gui SMS,
+        * thi day la gian doan chu dong, khong bao LED server loi.
+        */
+        bool ppp_down_for_cs =
+            st &&
+            st->type == APP_NET_PPP &&
+            (modem_service_is_cs_session_active() ||
+            !modem_service_should_auto_restart_ppp());
+
         if (st && st->type == s_net_type) {
+            active_link_down = true;
             s_uplink_ready = false;
         }
+
         if (!st) {
+            active_link_down = true;
             s_uplink_ready = false;
             s_net_type = APP_NET_NONE;
         }
 
-        tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        if (mqtt_service_is_connected()) {
+            tm1638_server_set_state(SERVER_LED_CONNECTED);
+        } else if (ppp_down_for_cs) {
+            ESP_LOGI(TAG, "PPP down during CS session -> keep server LED state");
+        } else if (active_link_down || !s_uplink_ready) {
+            tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
+        }
     }
 
 }
@@ -2937,23 +3100,182 @@ static void modem_task(void *arg)
     }
 }
 
+// static void process_incoming_sms_commands(void)
+// {
+//     int64_t now_ms = esp_timer_get_time() / 1000;
+
+//     bool mqtt_online = s_uplink_ready && mqtt_service_is_connected();
+
+//     /*
+//      * Chi poll thua khi dang dung PPP/4G.
+//      * Ethernet/WiFi thi van poll nhanh vi SMS khong lam mat duong mang chinh.
+//      */
+//     bool ppp_mqtt_online =
+//         mqtt_online &&
+//         (s_net_type == APP_NET_PPP);
+
+//         uint32_t poll_interval_ms = ppp_mqtt_online
+//             ? APP_SMS_COMMAND_POLL_PPP_ONLINE_MS
+//             : APP_SMS_COMMAND_POLL_MS;
+
+//     /*
+//      * MQTT vua connected thi khong poll SMS ngay.
+//      * Neu poll luc nay, poll_sms se stop PPP de vao CS service,
+//      * lam MQTT vua len da bi disconnect.
+//      */
+//     // if (mqtt_online &&
+//     //     s_last_mqtt_connected_ms > 0 &&
+//     //     (now_ms - s_last_mqtt_connected_ms) < APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS) {
+//     //     return;
+//     // }
+
+//     if (ppp_mqtt_online &&
+//         s_last_mqtt_connected_ms > 0 &&
+//         (now_ms - s_last_mqtt_connected_ms) < APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS) {
+//         return;
+//     }
+
+//     if ((now_ms - s_last_sms_command_poll_ms) < poll_interval_ms) {
+//         return;
+//     }
+
+//     if (s_modem_busy) {
+//         if (s_modem_busy_since_ms == 0) {
+//             s_modem_busy_since_ms = now_ms;
+//         }
+
+//         if (modem_service_is_cs_session_active() &&
+//             modem_service_is_busy_too_long(60000)) {
+//             ESP_LOGE(TAG, "modem CS session busy too long -> restart device");
+//             esp_restart();
+//         }
+
+//         if ((now_ms - s_modem_busy_since_ms) > 60000) {
+//             ESP_LOGE(TAG, "app modem busy too long -> restart device");
+//             esp_restart();
+//         }
+
+//         return;
+//     }
+
+//     s_modem_busy_since_ms = 0;
+
+//     if (enqueue_modem_job(MODEM_JOB_POLL_INBOX)) {
+//         s_last_sms_command_poll_ms = now_ms;
+//         ESP_LOGW(TAG,
+//                  "SMS_POLL_QUEUED interval=%lu mqtt_online=%d",
+//                  (unsigned long)poll_interval_ms,
+//                  mqtt_online ? 1 : 0);
+//     } else {
+//         ESP_LOGE(TAG, "SMS_POLL_QUEUE_FAILED");
+//     }
+// }
+
 static void process_incoming_sms_commands(void)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
 
-    if ((now_ms - s_last_sms_command_poll_ms) < APP_SMS_COMMAND_POLL_MS) {
+    bool mqtt_online = s_uplink_ready && mqtt_service_is_connected();
+
+    /*
+     * Neu dang o net PPP thi poll SMS theo chu ky PPP,
+     * ke ca luc MQTT dang reconnect.
+     */
+    bool ppp_context = (s_net_type == APP_NET_PPP);
+
+    /*
+     * SIM/modem da san sang de doc/gui SMS hay chua.
+     * Khi boot Ethernet/WiFi, modem co the chua tra loi AT,
+     * neu poll 10s/lần se gay timeout lien tuc.
+     */
+    bool modem_sms_ready = modem_service_is_sim_ready();
+
+    // uint32_t poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
+
+    // if (ppp_context) {
+    //     poll_interval_ms = APP_SMS_COMMAND_POLL_PPP_ONLINE_MS;
+    // } else if (!modem_sms_ready) {
+    //     poll_interval_ms = APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS;
+    // } else {
+    //     poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
+    // }
+    uint32_t poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
+
+    if (ppp_context) {
+        poll_interval_ms = APP_SMS_COMMAND_POLL_PPP_ONLINE_MS;
+    } else if (!modem_sms_ready) {
+        /*
+        * Khi moi boot, SIM/modem chua ready:
+        * Thu nhanh vai lan dau de LED SIM va SMS san sang som hon.
+        * Neu van chua ready thi moi gian ra 60s de tranh spam AT.
+        */
+        if (s_sms_modem_not_ready_fast_try < 3) {
+            poll_interval_ms = 10000UL;
+        } else {
+            poll_interval_ms = APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS;
+        }
+    } else {
+        poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
+    }
+    /*
+     * Chi chan poll SMS ngay sau MQTT connected khi dang PPP.
+     * Ethernet/WiFi khong can chan, nhung neu modem chua ready thi da co interval 60s o tren.
+     */
+    if (ppp_context &&
+        mqtt_online &&
+        s_last_mqtt_connected_ms > 0 &&
+        (now_ms - s_last_mqtt_connected_ms) < APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS) {
+        return;
+    }
+
+    if ((now_ms - s_last_sms_command_poll_ms) < poll_interval_ms) {
         return;
     }
 
     if (s_modem_busy) {
-        ESP_LOGW(TAG, "SMS_POLL_SKIP: modem_busy=1");
+        if (s_modem_busy_since_ms == 0) {
+            s_modem_busy_since_ms = now_ms;
+        }
+
+        if (modem_service_is_cs_session_active() &&
+            modem_service_is_busy_too_long(60000)) {
+            ESP_LOGE(TAG, "modem CS session busy too long -> restart device");
+            esp_restart();
+        }
+
+        if ((now_ms - s_modem_busy_since_ms) > 60000) {
+            ESP_LOGE(TAG, "app modem busy too long -> restart device");
+            esp_restart();
+        }
+
         return;
     }
 
+    s_modem_busy_since_ms = 0;
+
     if (enqueue_modem_job(MODEM_JOB_POLL_INBOX)) {
         s_last_sms_command_poll_ms = now_ms;
-        ESP_LOGW(TAG, "SMS_POLL_QUEUED");
-    } else {
+
+        if (!ppp_context && !modem_sms_ready) {
+            if (s_sms_modem_not_ready_fast_try < 255) {
+                s_sms_modem_not_ready_fast_try++;
+            }
+        }
+
+        if (modem_sms_ready) {
+            s_sms_modem_not_ready_fast_try = 0;
+        }
+
+        ESP_LOGW(TAG,
+                "SMS_POLL_QUEUED interval=%lu mqtt_online=%d net=%s ppp_context=%d sim_ready=%d fast_try=%u",
+                (unsigned long)poll_interval_ms,
+                mqtt_online ? 1 : 0,
+                net_type_to_str_internal(s_net_type),
+                ppp_context ? 1 : 0,
+                modem_sms_ready ? 1 : 0,
+                (unsigned)s_sms_modem_not_ready_fast_try);
+    }
+    else {
         ESP_LOGE(TAG, "SMS_POLL_QUEUE_FAILED");
     }
 }
@@ -3067,90 +3389,188 @@ static void publish_task(void *arg)
         tm1638_server_led_tick_100ms();
         sim_led_tick_100ms();
         if ((now - last_publish) >= pdMS_TO_TICKS(s_pub_period_ms)) {
+            bool di1 = false;
+            bool di2 = false;
+            bool di3 = false;
+            bool do1 = false;
+            bool do2 = false;
+
+            board_tca_read_pin(APP_DI1_TCA_PIN, &di1);
+            board_tca_read_pin(APP_DI2_TCA_PIN, &di2);
+            board_tca_read_pin(APP_DI3_TCA_PIN, &di3);
+
+            board_tca_get_output_pin(APP_DO1_TCA_PIN, &do1);
+            board_tca_get_output_pin(APP_DO2_TCA_PIN, &do2);
+
+            power_sample_t power_sample = {0};
+            power_state_t power_state = POWER_STATE_UNKNOWN;
+            int main_mv = 0;
+            int backup_mv = 0;
+
+            if (power_monitor_get_latest(&power_sample, &power_state) == ESP_OK) {
+                main_mv = (int)(power_sample.main_v * 1000.0f);
+                backup_mv = (int)(power_sample.bk_v * 1000.0f);
+            }
+
+            float temp1_pub = s_last_temp1_c;
+            float temp2_pub = s_last_temp2_c;
+            float temp_sht_pub = s_last_sht30_temp_c;
+            float hum_sht_pub = s_runtime_cfg.hum_enabled ? s_last_humidity : 0.0f;
+            time_t ts_now = time(NULL);
+
+            snprintf(payload, sizeof(payload),
+                    "{\"version\":\"%s\","
+                     "\"ts\":%lld,"
+                    "\"temp1\":%.2f,"
+                    "\"temp2\":%.2f,"
+                    "\"temp_sht\":%.2f,"
+                    "\"hum_sht\":%.2f,"
+                    "\"dienap\":%d,"
+                    "\"u_backup\":%d,"
+                    "\"input1\":%s,"
+                    "\"input2\":%s,"
+                    "\"input3\":%s,"
+                    "\"output1\":%s,"
+                    "\"output2\":%s,"
+                    "\"output3\":%s,"
+                    "\"lat\":0,"
+                    "\"lon\":0}",
+                    APP_FW_VERSION,
+                     (long long)ts_now,
+                    temp1_pub,
+                    temp2_pub,
+                    temp_sht_pub,
+                    hum_sht_pub,
+                    main_mv,
+                    backup_mv,
+                    di1 ? "true" : "false",
+                    di2 ? "true" : "false",
+                    di3 ? "true" : "false",
+                    do1 ? "true" : "false",
+                    do2 ? "true" : "false",
+                    "false");
+
+            ESP_LOGI(TAG,
+                    "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
+                    di1 ? 1 : 0,
+                    di2 ? 1 : 0,
+                    di3 ? 1 : 0,
+                    do1 ? 1 : 0,
+                    do2 ? 1 : 0,
+                    main_mv,
+                    backup_mv);
+
             if (s_uplink_ready && mqtt_service_is_connected()) {
-                bool di1 = false;
-                bool di2 = false;
-                bool di3 = false;
-                bool do1 = false;
-                bool do2 = false;
-
-                board_tca_read_pin(APP_DI1_TCA_PIN, &di1);
-                board_tca_read_pin(APP_DI2_TCA_PIN, &di2);
-                board_tca_read_pin(APP_DI3_TCA_PIN, &di3);
-
-                board_tca_get_output_pin(APP_DO1_TCA_PIN, &do1);
-                board_tca_get_output_pin(APP_DO2_TCA_PIN, &do2);
-
-                power_sample_t power_sample = {0};
-                power_state_t power_state = POWER_STATE_UNKNOWN;
-                int main_mv = 0;
-                int backup_mv = 0;
-
-                if (power_monitor_get_latest(&power_sample, &power_state) == ESP_OK) {
-                    main_mv = (int)(power_sample.main_v * 1000.0f);
-                    backup_mv = (int)(power_sample.bk_v * 1000.0f);
-                }
-
-                float temp1_pub = s_last_temp1_c;
-                float temp2_pub = s_last_temp2_c;
-                float temp_sht_pub = s_last_sht30_temp_c;
-            
-                // float hum_sht_pub = (s_runtime_cfg.hum_enabled && s_humidity_valid)
-                //     ? s_last_humidity : 0.0f;
-                // HUM_OFF => gui 0; loi SHT30 => giu gia tri hop le cuoi cung
-                float hum_sht_pub = s_runtime_cfg.hum_enabled ? s_last_humidity : 0.0f;
-                ESP_LOGI(TAG, "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
-                         di1 ? 1 : 0, di2 ? 1 : 0, di3 ? 1 : 0, do1 ? 1 : 0, do2 ? 1 : 0,
-                         main_mv, backup_mv);
-
-                snprintf(payload, sizeof(payload),
-                         "{\"version\":\"%s\","
-                         "\"temp1\":%.2f,"
-                         "\"temp2\":%.2f,"
-                         "\"temp_sht\":%.2f,"
-                         "\"hum_sht\":%.2f,"
-                         "\"dienap\":%d,"
-                         "\"u_backup\":%d,"
-                         "\"input1\":%s,"
-                         "\"input2\":%s,"
-                         "\"input3\":%s,"
-                         "\"output1\":%s,"
-                         "\"output2\":%s,"
-                         "\"output3\":%s,"
-                         "\"lat\":0,"
-                         "\"lon\":0}",
-                         APP_FW_VERSION,
-                         temp1_pub,
-                         temp2_pub,
-                         temp_sht_pub,
-                         hum_sht_pub,
-                         main_mv,
-                         backup_mv,
-                         di1 ? "true" : "false",
-                         di2 ? "true" : "false",
-                         di3 ? "true" : "false",
-                         do1 ? "true" : "false",
-                         do2 ? "true" : "false",
-                         "false");
-
                 int mid = mqtt_service_publish_telemetry(payload);
                 ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
+
+                telemetry_queue_flush_some();
             } else {
-                ESP_LOGW(TAG, "skip publish uplink=%d mqtt=%d net=%s temp1=%.2f valid1=%d temp2=%.2f valid2=%d hum=%.2f valid=%d",
-                         s_uplink_ready ? 1 : 0,
-                         mqtt_service_is_connected() ? 1 : 0,
-                         net_type_to_str_internal(s_net_type),
-                         s_last_temp1_c,
-                         s_ntc1_valid ? 1 : 0,
-                         s_last_temp2_c,
-                         s_ntc2_valid ? 1 : 0,
-                         s_last_humidity,
-                         s_humidity_valid ? 1 : 0);
+                ESP_LOGW(TAG,
+                        "queue publish uplink=%d mqtt=%d net=%s payload=%s",
+                        s_uplink_ready ? 1 : 0,
+                        mqtt_service_is_connected() ? 1 : 0,
+                        net_type_to_str_internal(s_net_type),
+                        payload);
+
+                telemetry_queue_push(payload);
             }
 
             last_publish = now;
             s_publish_count++;
         }
+
+        // if ((now - last_publish) >= pdMS_TO_TICKS(s_pub_period_ms)) {
+        //     if (s_uplink_ready && mqtt_service_is_connected()) {
+        //         bool di1 = false;
+        //         bool di2 = false;
+        //         bool di3 = false;
+        //         bool do1 = false;
+        //         bool do2 = false;
+
+        //         board_tca_read_pin(APP_DI1_TCA_PIN, &di1);
+        //         board_tca_read_pin(APP_DI2_TCA_PIN, &di2);
+        //         board_tca_read_pin(APP_DI3_TCA_PIN, &di3);
+
+        //         board_tca_get_output_pin(APP_DO1_TCA_PIN, &do1);
+        //         board_tca_get_output_pin(APP_DO2_TCA_PIN, &do2);
+
+        //         power_sample_t power_sample = {0};
+        //         power_state_t power_state = POWER_STATE_UNKNOWN;
+        //         int main_mv = 0;
+        //         int backup_mv = 0;
+
+        //         if (power_monitor_get_latest(&power_sample, &power_state) == ESP_OK) {
+        //             main_mv = (int)(power_sample.main_v * 1000.0f);
+        //             backup_mv = (int)(power_sample.bk_v * 1000.0f);
+        //         }
+
+        //         float temp1_pub = s_last_temp1_c;
+        //         float temp2_pub = s_last_temp2_c;
+        //         float temp_sht_pub = s_last_sht30_temp_c;
+            
+        //         // float hum_sht_pub = (s_runtime_cfg.hum_enabled && s_humidity_valid)
+        //         //     ? s_last_humidity : 0.0f;
+        //         // HUM_OFF => gui 0; loi SHT30 => giu gia tri hop le cuoi cung
+        //         float hum_sht_pub = s_runtime_cfg.hum_enabled ? s_last_humidity : 0.0f;
+        //         ESP_LOGI(TAG, "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
+        //                  di1 ? 1 : 0, di2 ? 1 : 0, di3 ? 1 : 0, do1 ? 1 : 0, do2 ? 1 : 0,
+        //                  main_mv, backup_mv);
+
+        //         snprintf(payload, sizeof(payload),
+        //                  "{\"version\":\"%s\","
+        //                  "\"temp1\":%.2f,"
+        //                  "\"temp2\":%.2f,"
+        //                  "\"temp_sht\":%.2f,"
+        //                  "\"hum_sht\":%.2f,"
+        //                  "\"dienap\":%d,"
+        //                  "\"u_backup\":%d,"
+        //                  "\"input1\":%s,"
+        //                  "\"input2\":%s,"
+        //                  "\"input3\":%s,"
+        //                  "\"output1\":%s,"
+        //                  "\"output2\":%s,"
+        //                  "\"output3\":%s,"
+        //                  "\"lat\":0,"
+        //                  "\"lon\":0}",
+        //                  APP_FW_VERSION,
+        //                  temp1_pub,
+        //                  temp2_pub,
+        //                  temp_sht_pub,
+        //                  hum_sht_pub,
+        //                  main_mv,
+        //                  backup_mv,
+        //                  di1 ? "true" : "false",
+        //                  di2 ? "true" : "false",
+        //                  di3 ? "true" : "false",
+        //                  do1 ? "true" : "false",
+        //                  do2 ? "true" : "false",
+        //                  "false");
+
+        //         // int mid = mqtt_service_publish_telemetry(payload);
+        //         // ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
+        //         //  telemetry_queue_flush_some();
+        //     if (s_uplink_ready && mqtt_service_is_connected()) {
+        //         int mid = mqtt_service_publish_telemetry(payload);
+        //         ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
+
+        //         telemetry_queue_flush_some();
+        //     }
+
+        //     } else {
+        //         ESP_LOGW(TAG,
+        //                 "queue publish uplink=%d mqtt=%d net=%s payload=%s",
+        //                 s_uplink_ready ? 1 : 0,
+        //                 mqtt_service_is_connected() ? 1 : 0,
+        //                 net_type_to_str_internal(s_net_type),
+        //                 payload);
+
+        //         telemetry_queue_push(payload);
+        //     }
+
+        //     last_publish = now;
+        //     s_publish_count++;
+        // }
 
         vTaskDelay(loop_tick);
     }
@@ -3607,6 +4027,10 @@ esp_err_t app_logic_init(void)
     s_last_sht30_sample = 0;
     s_last_rtc_sync_check = 0;
 
+    s_telemetry_q_head = 0;
+    s_telemetry_q_count = 0;
+    memset(s_telemetry_queue, 0, sizeof(s_telemetry_queue));
+
     adc_oneshot_unit_handle_t pm_adc = power_monitor_get_adc_handle();
     if (pm_adc != NULL) {
         ntc_init(&s_ntc1, APP_NTC1_ADC_CHANNEL, pm_adc);
@@ -3752,7 +4176,10 @@ esp_err_t app_logic_init(void)
     s_power_lost_notify_count = 0;
 
     s_power_boot_checked = false;
-    s_last_sms_command_poll_ms = 0;
+    //s_last_sms_command_poll_ms = 0;
+    s_last_sms_command_poll_ms =
+        (esp_timer_get_time() / 1000) - APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS + 10000;
+    s_sms_modem_not_ready_fast_try = 0;
     s_modem_busy = false;
     s_ntc_fault_sms_pending = false;
     s_ntc_fault_sms_sent = false;
@@ -3771,8 +4198,8 @@ esp_err_t app_logic_init(void)
     s_last_sht_restored_sms_try_ms = 0;
     s_sht_restored_sms_job_queued = false;
 
-    esp_err_t del_err = modem_service_delete_all_sms();
-    ESP_LOGI(TAG, "delete all sms on boot: %s", esp_err_to_name(del_err));
+    // esp_err_t del_err = modem_service_delete_all_sms();
+    // ESP_LOGI(TAG, "delete all sms on boot: %s", esp_err_to_name(del_err));
 
     ESP_ERROR_CHECK(esp_event_handler_register(APP_EVENTS, APP_EVENT_CLOUD_COMMAND, app_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(APP_EVENTS, APP_EVENT_MQTT_CONNECTED, app_event_handler, NULL));
@@ -4434,6 +4861,31 @@ static void update_display_brightness_by_power(void)
         ESP_LOGW(TAG, "display brightness update failed: %s", esp_err_to_name(err));
     }
 }
+
+// static void update_sim_led_from_modem_state(void)
+// {
+//     if (modem_service_is_sim_ready()) {
+//         sim_led_set_state(SIM_LED_STATE_READY);
+//         return;
+//     }
+
+//     modem_state_t ms = modem_service_get_state();
+
+//     switch (ms) {
+//     case MODEM_STATE_INIT:
+//     case MODEM_STATE_SYNC:
+//     case MODEM_STATE_DATA:
+//     case MODEM_STATE_WAIT_IP:
+//     case MODEM_STATE_RECOVERING:
+//         sim_led_set_state(SIM_LED_STATE_SEARCHING);
+//         break;
+
+//     case MODEM_STATE_OFF:
+//     default:
+//         sim_led_set_state(SIM_LED_STATE_OFF);
+//         break;
+//     }
+// }
 
 static void update_sim_led_from_modem_state(void)
 {

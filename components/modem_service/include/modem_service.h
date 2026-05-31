@@ -50,3 +50,4 @@ bool modem_service_should_auto_restart_ppp(void);
 bool modem_service_is_cs_session_active(void);
 esp_err_t modem_service_delete_all_sms(void);
 
+bool modem_service_is_busy_too_long(uint32_t timeout_ms);

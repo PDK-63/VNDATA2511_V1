@@ -464,14 +464,30 @@ esp_err_t mqtt_service_start(void)
 
     if (s_lock) xSemaphoreGive(s_lock);
 
+    // if (stale) {
+    //     ESP_LOGW(TAG, "stale mqtt client exists, destroy before restart");
+    //     if (stale_started && stale_connected) {
+    //         esp_err_t err = esp_mqtt_client_stop(stale);
+    //         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    //             ESP_LOGW(TAG, "esp_mqtt_client_stop(stale) returned %s", esp_err_to_name(err));
+    //         }
+    //     }
+    //     esp_mqtt_client_destroy(stale);
+    //     vTaskDelay(pdMS_TO_TICKS(200));
+    // }
     if (stale) {
-        ESP_LOGW(TAG, "stale mqtt client exists, destroy before restart");
-        if (stale_started && stale_connected) {
+        ESP_LOGW(TAG, "stale mqtt client exists, stop/destroy before restart");
+
+        if (stale_started || stale_connected) {
             esp_err_t err = esp_mqtt_client_stop(stale);
             if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "esp_mqtt_client_stop(stale) returned %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "esp_mqtt_client_stop(stale) returned %s",
+                        esp_err_to_name(err));
             }
+
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
+
         esp_mqtt_client_destroy(stale);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -571,19 +587,33 @@ esp_err_t mqtt_service_stop(void)
 
     if (s_lock) xSemaphoreGive(s_lock);
 
+    // if (client) {
+    //     if (was_started && was_connected) {
+    //         esp_err_t err = esp_mqtt_client_stop(client);
+    //         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    //             ESP_LOGW(TAG, "esp_mqtt_client_stop returned %s", esp_err_to_name(err));
+    //         }
+    //     } else {
+    //         ESP_LOGI(TAG, "mqtt stop skip esp_mqtt_client_stop, destroy directly");
+    //     }
+
+    //     esp_mqtt_client_destroy(client);
+    // }
     if (client) {
-        if (was_started && was_connected) {
+        if (was_started || was_connected || was_connecting) {
             esp_err_t err = esp_mqtt_client_stop(client);
             if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-                ESP_LOGW(TAG, "esp_mqtt_client_stop returned %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "esp_mqtt_client_stop returned %s",
+                        esp_err_to_name(err));
             }
+
+            vTaskDelay(pdMS_TO_TICKS(200));
         } else {
             ESP_LOGI(TAG, "mqtt stop skip esp_mqtt_client_stop, destroy directly");
         }
 
         esp_mqtt_client_destroy(client);
     }
-
     ESP_LOGI(TAG, "mqtt stop destroy done");
     return ESP_OK;
 }

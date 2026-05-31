@@ -61,7 +61,13 @@
 #define APP_NTC_HIGH_LIMIT_C             100.0f
 #define APP_HUM_LOW_LIMIT_PCT            0.0f
 #define APP_HUM_HIGH_LIMIT_PCT           100.0f
-#define APP_SMS_COMMAND_POLL_MS          10000
+
+//#define APP_SMS_COMMAND_POLL_MS          10000
+#define APP_SMS_COMMAND_POLL_MS                 10000UL   // Ethernet/WiFi: 10s
+#define APP_SMS_COMMAND_POLL_PPP_ONLINE_MS      60000UL   // PPP/4G: 60s
+#define APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS    15000UL   // PPP MQTT vua len thi cho 15s
+
+#define APP_WIFI_RECHECK_FROM_4G_MS      (60 * 1000UL)
 
 /* MQTT */
 #define APP_MQTT_URI                      "mqtt://giamsatnhietdo.vn:1883"                             // "mqtts://broker.hivemq.com:8883"

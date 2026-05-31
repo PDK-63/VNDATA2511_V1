@@ -61,15 +61,23 @@ static modem_state_t s_state = MODEM_STATE_OFF;
 
 static volatile bool s_manual_ppp_suspend;
 static volatile bool s_cs_session_active;
-
+static bool s_cs_session_had_ppp = false;
 static uint32_t s_sync_fail_streak;
 static uint32_t s_early_ppp_lost_count;
 static TickType_t s_ppp_up_tick;
 
 static esp_err_t modem_wait_for_at_ready(int timeout_ms);
 static volatile bool s_sim_card_ready = false;
+static TickType_t s_cs_session_start_tick = 0;
+static uint8_t s_cs_at_sync_fail_count = 0;
 
-static void modem_escape_data_mode_uart(uart_port_t port)
+static esp_err_t modem_poll_unread_sms_command_mode(char *number,
+                                                    size_t number_len,
+                                                    char *text,
+                                                    size_t text_len,
+                                                    bool *found);
+static esp_err_t modem_send_sms_command_mode(const char *number, const char *text);
+                                                    static void modem_escape_data_mode_uart(uart_port_t port)
 {
     uart_wait_tx_done(port, pdMS_TO_TICKS(1000));
     vTaskDelay(pdMS_TO_TICKS(1200));
@@ -118,9 +126,6 @@ static esp_err_t modem_wait_ready_for_ppp(void)
 
         (void)modem_at_cmd("AT", buf, sizeof(buf), 1000);
 
-        // if (modem_at_cmd("AT+CPIN?", buf, sizeof(buf), 3000) == ESP_OK) {
-        //     sim_ready = str_has(buf, "READY");
-        // }
         if (modem_at_cmd("AT+CPIN?", buf, sizeof(buf), 3000) == ESP_OK) {
             sim_ready = str_has(buf, "READY");
             modem_service_set_sim_ready(sim_ready);
@@ -187,9 +192,22 @@ static esp_err_t modem_sync_with_recover(void)
     if (s_sync_fail_streak >= APP_MODEM_HARD_RECOVER_FAILS) {
         ESP_LOGW(TAG, "sync failed too many times -> power cycle modem");
         s_sync_fail_streak = 0;
+
         diag_inc_modem_power_cycle();
-        ESP_ERROR_CHECK(board_modem_power_cycle());
+
+        esp_err_t reset_err = board_modem_power_cycle();
+        if (reset_err != ESP_OK) {
+            ESP_LOGE(TAG,
+                    "modem power cycle failed during sync recover: %s",
+                    esp_err_to_name(reset_err));
+        } else {
+            ESP_LOGW(TAG, "modem power cycle done during sync recover");
+        }
+
         vTaskDelay(pdMS_TO_TICKS(8000));
+
+        s_state = MODEM_STATE_INIT;
+        modem_service_set_sim_ready(false);
     }
 
     return ESP_ERR_TIMEOUT;
@@ -222,6 +240,7 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 
         xEventGroupSetBits(s_ev, MODEM_IP_READY_BIT);
         s_state = MODEM_STATE_RUNNING;
+        modem_service_set_sim_ready(true);
         s_ppp_up_tick = xTaskGetTickCount();
         s_early_ppp_lost_count = 0;
 
@@ -426,72 +445,225 @@ bool modem_service_is_cs_session_active(void)
 
 static esp_err_t modem_service_begin_cs_session(const char *name)
 {
+    const char *session_name = name ? name : "cs";
+
     if (!s_dce) {
         return ESP_ERR_INVALID_STATE;
     }
 
     if (xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGE(TAG, "%s: modem busy timeout", name);
+        ESP_LOGE(TAG, "%s: modem busy timeout", session_name);
         return ESP_ERR_TIMEOUT;
     }
 
     s_cs_session_active = true;
-    s_manual_ppp_suspend = true;
+    s_cs_session_had_ppp = false;
+    s_cs_session_start_tick = xTaskGetTickCount();
 
-    ESP_LOGW(TAG, "%s: stop PPP before CS service", name);
-    esp_err_t err = modem_service_stop_ppp();
+    /*
+     * Chi stop PPP neu truoc do modem that su dang chay PPP/DATA.
+     */
+    s_cs_session_had_ppp =
+        modem_service_is_ip_ready() ||
+        (s_state == MODEM_STATE_DATA) ||
+        (s_state == MODEM_STATE_WAIT_IP) ||
+        (s_state == MODEM_STATE_RUNNING);
+
+    bool need_restart_ppp = s_cs_session_had_ppp;
+
+    if (s_cs_session_had_ppp) {
+        s_manual_ppp_suspend = true;
+
+        ESP_LOGW(TAG, "%s: stop PPP before CS service", session_name);
+
+        esp_err_t stop_err = modem_service_stop_ppp();
+
+        if (stop_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "%s: stop PPP failed: %s, try continue CS sync",
+                     session_name,
+                     esp_err_to_name(stop_err));
+
+            /*
+             * Khong return ngay.
+             * Co truong hop PPP dang mat IP / dang closing,
+             * stop PPP tra loi, nhung modem van co the quay lai AT.
+             */
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    } else {
+        /*
+         * Dang dung Ethernet/WiFi hoac modem idle command mode:
+         * khong stop PPP, khong manual suspend.
+         */
+        s_manual_ppp_suspend = false;
+
+        ESP_LOGI(TAG, "%s: no PPP active, use command mode", session_name);
+    }
+    esp_err_t err = modem_wait_for_at_ready(15000);
+
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: stop PPP failed: %s", name, esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s: sync before CS service failed: %s",
+                session_name,
+                esp_err_to_name(err));
+
+        s_cs_at_sync_fail_count++;
+
+        ESP_LOGE(TAG,
+                "%s: CS AT sync fail count=%u",
+                session_name,
+                (unsigned)s_cs_at_sync_fail_count);
+
+        /*
+        * Clear CS session/busy truoc, khong de app bi ket modem busy.
+        */
         s_manual_ppp_suspend = false;
         s_cs_session_active = false;
+        s_cs_session_had_ppp = false;
+        s_cs_session_start_tick = 0;
+
         xSemaphoreGive(s_cs_op_lock);
+
+        /*
+        * Neu truoc do dang co PPP, thu restart PPP lai.
+        */
+        if (need_restart_ppp) {
+            ESP_LOGW(TAG, "%s: AT sync failed -> try restart PPP", session_name);
+
+            esp_err_t restart_err = modem_service_restart_ppp();
+            if (restart_err != ESP_OK) {
+                ESP_LOGE(TAG, "%s: restart PPP after AT sync failed: %s",
+                        session_name,
+                        esp_err_to_name(restart_err));
+            }
+        } else {
+            /*
+            * Dang Ethernet/WiFi, khong co PPP de restart.
+            * Neu modem lien tuc khong tra loi AT thi power cycle modem.
+            */
+            if (s_cs_at_sync_fail_count >= 2) {
+                ESP_LOGE(TAG,
+                        "%s: AT sync failed too many times without PPP -> power cycle modem",
+                        session_name);
+
+                s_cs_at_sync_fail_count = 0;
+
+                diag_inc_modem_power_cycle();
+
+                esp_err_t reset_err = board_modem_power_cycle();
+                if (reset_err != ESP_OK) {
+                    ESP_LOGE(TAG,
+                            "%s: modem power cycle failed: %s",
+                            session_name,
+                            esp_err_to_name(reset_err));
+                } else {
+                    ESP_LOGW(TAG, "%s: modem power cycle done", session_name);
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(8000));
+
+                s_state = MODEM_STATE_INIT;
+                modem_service_set_sim_ready(false);
+            }
+        }
+
         return err;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    err = modem_wait_for_at_ready(15000);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: sync before CS service failed: %s", name, esp_err_to_name(err));
-        s_manual_ppp_suspend = false;
-        s_cs_session_active = false;
-        xSemaphoreGive(s_cs_op_lock);
-        return err;
-    }
-
+    s_cs_at_sync_fail_count = 0;
     return ESP_OK;
+    // esp_err_t err = modem_wait_for_at_ready(15000);
+
+    // if (err != ESP_OK) {
+    //     ESP_LOGE(TAG, "%s: sync before CS service failed: %s",
+    //              session_name,
+    //              esp_err_to_name(err));
+
+    //     /*
+    //      * Clear CS session/busy truoc, khong de app bi ket modem busy.
+    //      */
+    //     s_manual_ppp_suspend = false;
+    //     s_cs_session_active = false;
+    //     s_cs_session_had_ppp = false;
+    //     s_cs_session_start_tick = 0;
+
+    //     xSemaphoreGive(s_cs_op_lock);
+
+    //     /*
+    //      * Neu truoc do dang co PPP, thu restart PPP lai.
+    //      */
+    //     if (need_restart_ppp) {
+    //         ESP_LOGW(TAG, "%s: AT sync failed -> try restart PPP", session_name);
+
+    //         esp_err_t restart_err = modem_service_restart_ppp();
+    //         if (restart_err != ESP_OK) {
+    //             ESP_LOGE(TAG, "%s: restart PPP after AT sync failed: %s",
+    //                      session_name,
+    //                      esp_err_to_name(restart_err));
+    //         }
+    //     }
+
+    //     return err;
+    // }
+
+    // return ESP_OK;
 }
 
 static esp_err_t modem_service_end_cs_session(const char *name, esp_err_t op_err)
 {
+    const char *session_name = name ? name : "cs";
     esp_err_t result = op_err;
 
-    ESP_LOGW(TAG, "%s: restart PPP after CS service", name);
-    esp_err_t restart_err = modem_service_restart_ppp();
+    /*
+     * Lưu lại việc trước đó có PPP hay không.
+     * Sau đó phải clear busy TRƯỚC khi restart PPP.
+     */
+    bool need_restart_ppp = s_cs_session_had_ppp;
+
+    /*
+     * Quan trọng:
+     * Không được giữ s_cs_session_active trong lúc restart PPP.
+     * Nếu SIM không có 4G / hết data, restart PPP có thể fail lâu,
+     * làm TT/alarm SMS bị chặn mãi.
+     */
     s_manual_ppp_suspend = false;
     s_cs_session_active = false;
+    s_cs_session_had_ppp = false;
+    s_cs_session_start_tick = 0;
+
     xSemaphoreGive(s_cs_op_lock);
 
-    if (restart_err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: restart PPP failed: %s", name, esp_err_to_name(restart_err));
-        if (result == ESP_OK) {
-            result = restart_err;
+    ESP_LOGW(TAG, "%s: CS session ended, modem busy cleared", session_name);
+
+    if (need_restart_ppp) {
+        ESP_LOGW(TAG, "%s: restart PPP after CS service", session_name);
+
+        esp_err_t restart_err = modem_service_restart_ppp();
+
+        if (restart_err != ESP_OK) {
+            ESP_LOGE(TAG, "%s: restart PPP failed: %s",
+                     session_name, esp_err_to_name(restart_err));
+
         }
+    } else {
+        ESP_LOGI(TAG, "%s: no PPP before CS service, keep command mode", session_name);
     }
 
     return result;
 }
-esp_err_t modem_service_send_sms(const char *number, const char *text)
+
+static esp_err_t modem_send_sms_command_mode(const char *number, const char *text)
 {
     char *resp = s_sms_send_buf;
     char cmd[96];
     esp_err_t err = ESP_FAIL;
 
-    if (!s_dce || !number || !text) {
+    // if (!s_dce || !number || !text) {
+    //     return ESP_ERR_INVALID_ARG;
+    // }
+    if (!s_dce || !number || !text || number[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
     }
 
     memset(resp, 0, sizeof(s_sms_send_buf));
@@ -601,23 +773,69 @@ esp_err_t modem_service_send_sms(const char *number, const char *text)
     err = ESP_OK;
 
 out_sms:
-    if (s_cs_op_lock) {
-        xSemaphoreGive(s_cs_op_lock);
-    }
     return err;
 }
 
-esp_err_t modem_service_start_call(const char *number)
+esp_err_t modem_service_send_sms(const char *number, const char *text)
+{
+    esp_err_t err;
+
+    if (!s_dce || !number || !text || number[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = modem_service_begin_cs_session("sms");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = modem_send_sms_command_mode(number, text);
+
+    return modem_service_end_cs_session("sms", err);
+}
+
+// esp_err_t modem_service_start_call(const char *number)
+// {
+//     char resp[512] = {0};
+//     char cmd[96];
+
+//     if (!s_dce || !number || !number[0]) {
+//         return ESP_ERR_INVALID_ARG;
+//     }
+
+//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+//         return ESP_ERR_TIMEOUT;
+//     }
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     snprintf(cmd, sizeof(cmd), "ATD%s;", number);
+//     memset(resp, 0, sizeof(resp));
+
+//     esp_err_t err = modem_at_cmd(cmd, resp, sizeof(resp), 3000);
+//     if (err == ESP_OK) {
+//         ESP_LOGI(TAG, "voice call dialing to %s", number);
+//     } else {
+//         ESP_LOGE(TAG, "dial failed: %s", esp_err_to_name(err));
+//     }
+
+//     xSemaphoreGive(s_cs_op_lock);
+//     return err;
+// }
+
+static esp_err_t modem_start_call_command_mode(const char *number)
 {
     char resp[512] = {0};
     char cmd[96];
 
-    if (!s_dce || !number || !number[0]) {
+    if (!s_dce || !number || number[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
     }
 
     uart_flush_input(s_cfg.uart_port);
@@ -629,29 +847,75 @@ esp_err_t modem_service_start_call(const char *number)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     snprintf(cmd, sizeof(cmd), "ATD%s;", number);
-    memset(resp, 0, sizeof(resp));
 
+    memset(resp, 0, sizeof(resp));
     esp_err_t err = modem_at_cmd(cmd, resp, sizeof(resp), 3000);
+
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "voice call dialing to %s", number);
     } else {
         ESP_LOGE(TAG, "dial failed: %s", esp_err_to_name(err));
     }
 
-    xSemaphoreGive(s_cs_op_lock);
     return err;
 }
 
-esp_err_t modem_service_hangup(void)
+esp_err_t modem_service_start_call(const char *number)
+{
+    esp_err_t err;
+
+    if (!s_dce || !number || number[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = modem_service_begin_cs_session("start_call");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = modem_start_call_command_mode(number);
+
+    return modem_service_end_cs_session("start_call", err);
+}
+
+// esp_err_t modem_service_hangup(void)
+// {
+//     char resp[256] = {0};
+
+//     if (!s_dce) {
+//         return ESP_ERR_INVALID_STATE;
+//     }
+
+//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+//         return ESP_ERR_TIMEOUT;
+//     }
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     esp_err_t err = modem_at_cmd("ATH", resp, sizeof(resp), 3000);
+//     if (err != ESP_OK) {
+//         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
+//         memset(resp, 0, sizeof(resp));
+//         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 3000);
+//     }
+
+//     if (err == ESP_OK) {
+//         ESP_LOGI(TAG, "voice call ended");
+//     } else {
+//         ESP_LOGE(TAG, "hangup failed");
+//     }
+
+//     xSemaphoreGive(s_cs_op_lock);
+//     return err;
+// }
+
+static esp_err_t modem_hangup_command_mode(void)
 {
     char resp[256] = {0};
 
     if (!s_dce) {
         return ESP_ERR_INVALID_STATE;
-    }
-
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
     }
 
     uart_flush_input(s_cfg.uart_port);
@@ -660,6 +924,7 @@ esp_err_t modem_service_hangup(void)
     esp_err_t err = modem_at_cmd("ATH", resp, sizeof(resp), 3000);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
+
         memset(resp, 0, sizeof(resp));
         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 3000);
     }
@@ -670,17 +935,97 @@ esp_err_t modem_service_hangup(void)
         ESP_LOGE(TAG, "hangup failed");
     }
 
-    xSemaphoreGive(s_cs_op_lock);
     return err;
 }
 
-esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
+esp_err_t modem_service_hangup(void)
+{
+    esp_err_t err;
+
+    if (!s_dce) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = modem_service_begin_cs_session("hangup");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = modem_hangup_command_mode();
+
+    return modem_service_end_cs_session("hangup", err);
+}
+
+// esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
+// {
+//     char resp[512] = {0};
+//     char cmd[96];
+//     esp_err_t err = ESP_FAIL;
+
+//     if (!s_dce || !number || !number[0]) {
+//         return ESP_ERR_INVALID_ARG;
+//     }
+
+//     if (duration_ms < 5000) {
+//         duration_ms = 5000;
+//     }
+
+//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+//         return ESP_ERR_TIMEOUT;
+//     }
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     memset(resp, 0, sizeof(resp));
+//     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     snprintf(cmd, sizeof(cmd), "ATD%s;", number);
+//     memset(resp, 0, sizeof(resp));
+//     err = modem_at_cmd(cmd, resp, sizeof(resp), 10000);
+//     if (err != ESP_OK) {
+//         ESP_LOGE(TAG, "dial failed: %s", esp_err_to_name(err));
+//         goto out_call;
+//     }
+
+//     ESP_LOGI(TAG, "voice call dialing to %s", number);
+
+//     vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     memset(resp, 0, sizeof(resp));
+//     err = modem_at_cmd("ATH", resp, sizeof(resp), 5000);
+//     if (err != ESP_OK) {
+//         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
+//         memset(resp, 0, sizeof(resp));
+//         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 5000);
+//         if (err != ESP_OK) {
+//             ESP_LOGE(TAG, "hangup failed");
+//             goto out_call;
+//         }
+//     }
+
+//     ESP_LOGI(TAG, "voice call ended");
+//     err = ESP_OK;
+
+// out_call:
+//     if (s_cs_op_lock) {
+//         xSemaphoreGive(s_cs_op_lock);
+//     }
+//     return err;
+// }
+
+static esp_err_t modem_make_call_command_mode(const char *number, uint32_t duration_ms)
 {
     char resp[512] = {0};
     char cmd[96];
-    esp_err_t err = ESP_FAIL;
 
-    if (!s_dce || !number || !number[0]) {
+    if (!s_dce || !number || number[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -688,25 +1033,21 @@ esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
         duration_ms = 5000;
     }
 
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
     uart_flush_input(s_cfg.uart_port);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    memset(resp, 0, sizeof(resp));
     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
 
     uart_flush_input(s_cfg.uart_port);
     vTaskDelay(pdMS_TO_TICKS(50));
 
     snprintf(cmd, sizeof(cmd), "ATD%s;", number);
+
     memset(resp, 0, sizeof(resp));
-    err = modem_at_cmd(cmd, resp, sizeof(resp), 10000);
+    esp_err_t err = modem_at_cmd(cmd, resp, sizeof(resp), 10000);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "dial failed: %s", esp_err_to_name(err));
-        goto out_call;
+        return err;
     }
 
     ESP_LOGI(TAG, "voice call dialing to %s", number);
@@ -720,22 +1061,36 @@ esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
     err = modem_at_cmd("ATH", resp, sizeof(resp), 5000);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
+
         memset(resp, 0, sizeof(resp));
         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 5000);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "hangup failed");
-            goto out_call;
-        }
     }
 
-    ESP_LOGI(TAG, "voice call ended");
-    err = ESP_OK;
-
-out_call:
-    if (s_cs_op_lock) {
-        xSemaphoreGive(s_cs_op_lock);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "voice call ended");
+    } else {
+        ESP_LOGE(TAG, "hangup failed");
     }
+
     return err;
+}
+
+esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
+{
+    esp_err_t err;
+
+    if (!s_dce || !number || number[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = modem_service_begin_cs_session("call");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = modem_make_call_command_mode(number, duration_ms);
+
+    return modem_service_end_cs_session("call", err);
 }
 
 static void trim_ascii(char *s)
@@ -765,13 +1120,20 @@ static bool modem_sms_ready(void)
         modem_service_set_sim_ready(sim_ready);
 
         ESP_LOGI(TAG, "CPIN resp: %s", resp);
+
     } else {
-        modem_service_set_sim_ready(false);
+        if (s_state == MODEM_STATE_DATA ||
+            s_state == MODEM_STATE_WAIT_IP ||
+            s_state == MODEM_STATE_RUNNING) {
+
+            ESP_LOGW(TAG, "AT+CPIN? failed in PPP/DATA mode, keep SIM ready state");
+        } else {
+            modem_service_set_sim_ready(false);
+        }
 
         ESP_LOGW(TAG, "AT+CPIN? failed");
         return false;
     }
-
     memset(resp, 0, sizeof(resp));
     if (modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 3000) == ESP_OK) {
         int n = 0, stat = 0;
@@ -826,7 +1188,84 @@ static esp_err_t modem_prepare_sms_storage(char *resp, size_t resp_sz)
     return err;
 }
 
-esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *text, size_t text_len, bool *found)
+static esp_err_t modem_set_sms_storage(const char *storage, char *resp, size_t resp_sz)
+{
+    char cmd[64];
+
+    if (!storage || !resp || resp_sz == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "AT+CPMS=\"%s\",\"%s\",\"%s\"",
+             storage, storage, storage);
+
+    memset(resp, 0, resp_sz);
+
+    esp_err_t err = modem_at_cmd(cmd, resp, resp_sz, 3000);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SMS storage set to %s resp=[%s]", storage, resp);
+    } else {
+        ESP_LOGW(TAG, "SMS storage set to %s failed: %s",
+                 storage, esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+static esp_err_t modem_read_cmgl_all(char *resp, size_t resp_sz)
+{
+    if (!resp || resp_sz == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(resp, 0, resp_sz);
+
+    uart_flush_input(s_cfg.uart_port);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    const char *cmd = "AT+CMGL=\"ALL\"\r\n";
+
+    uart_write_bytes(s_cfg.uart_port, cmd, strlen(cmd));
+    uart_wait_tx_done(s_cfg.uart_port, pdMS_TO_TICKS(1000));
+
+    size_t used = 0;
+    TickType_t start = xTaskGetTickCount();
+
+    while (used < resp_sz - 1) {
+        int len = uart_read_bytes(
+            s_cfg.uart_port,
+            (uint8_t *)&resp[used],
+            resp_sz - 1 - used,
+            pdMS_TO_TICKS(300)
+        );
+
+        if (len > 0) {
+            used += (size_t)len;
+            resp[used] = '\0';
+
+            if (strstr(resp, "\r\nOK") ||
+                strstr(resp, "\nOK") ||
+                strstr(resp, "ERROR")) {
+                break;
+            }
+        }
+
+        if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(12000)) {
+            break;
+        }
+    }
+
+    ESP_LOGW(TAG, "CMGL ALL raw resp: [%s]", resp);
+
+    if (strstr(resp, "ERROR")) {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t modem_poll_unread_sms_command_mode(char *number, size_t number_len, char *text, size_t text_len, bool *found)
 {
     char *resp = s_sms_resp_buf;
     char cmd[64];
@@ -840,9 +1279,11 @@ esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *t
     number[0] = 0;
     text[0] = 0;
 
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
+    // if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+    //     return ESP_ERR_TIMEOUT;
+    // }
+    // s_cs_session_active = true;
+    // s_cs_session_start_tick = xTaskGetTickCount();
 
     memset(resp, 0, sizeof(s_sms_resp_buf));
 
@@ -870,55 +1311,45 @@ esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *t
         goto out;
     }
 
-    uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
     memset(resp, 0, sizeof(s_sms_resp_buf));
     (void)modem_at_cmd("AT+CPMS?", resp, sizeof(s_sms_resp_buf), 3000);
     ESP_LOGI(TAG, "CPMS? resp: %s", resp);
 
-    uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    /*
+    * Đọc SMS ở MT trước.
+    * Nếu MT không có SMS thì đọc tiếp SM.
+    */
+    bool has_sms = false;
 
-    err = modem_prepare_sms_storage(resp, sizeof(s_sms_resp_buf));
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "prepare sms storage failed");
-        err = ESP_OK;
-        goto out;
-    }
-
-    uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    const char *list_cmd = "AT+CMGL=\"ALL\"\r";
-    uart_write_bytes(s_cfg.uart_port, list_cmd, strlen(list_cmd));
-    uart_wait_tx_done(s_cfg.uart_port, pdMS_TO_TICKS(1000));
-
-    size_t used = 0;
-    int idle_rounds = 0;
-    while (used < sizeof(s_sms_resp_buf) - 1 && idle_rounds < 8) {
-        int len = uart_read_bytes(
-            s_cfg.uart_port,
-            (uint8_t *)&resp[used],
-            sizeof(s_sms_resp_buf) - 1 - used,
-            pdMS_TO_TICKS(250)
-        );
-
-        if (len > 0) {
-            used += (size_t)len;
-            resp[used] = 0;
-            idle_rounds = 0;
-        } else {
-            idle_rounds++;
+    /* 1. Thử MT */
+    if (modem_set_sms_storage("MT", resp, sizeof(s_sms_resp_buf)) == ESP_OK) {
+        if (modem_read_cmgl_all(resp, sizeof(s_sms_resp_buf)) == ESP_OK &&
+            strstr(resp, "+CMGL:") != NULL) {
+            has_sms = true;
+            ESP_LOGW(TAG, "SMS found in MT");
         }
     }
 
-    if (used == 0) {
-        ESP_LOGW(TAG, "CMGL ALL raw resp empty");
+    /* 2. Nếu MT không có thì thử SM */
+    if (!has_sms) {
+        ESP_LOGW(TAG, "No SMS in MT, try SM");
+
+        if (modem_set_sms_storage("SM", resp, sizeof(s_sms_resp_buf)) == ESP_OK) {
+            if (modem_read_cmgl_all(resp, sizeof(s_sms_resp_buf)) == ESP_OK &&
+                strstr(resp, "+CMGL:") != NULL) {
+                has_sms = true;
+                ESP_LOGW(TAG, "SMS found in SM");
+            }
+        }
+    }
+
+    /* 3. Nếu cả MT và SM đều không có */
+    if (!has_sms) {
+        ESP_LOGW(TAG, "No SMS found in MT/SM");
         err = ESP_OK;
         goto out;
     }
-    ESP_LOGW(TAG, "CMGL ALL raw resp: [%s]", resp);
+
     char *p = resp;
     while ((p = strstr(p, "+CMGL:")) != NULL) {
         int index = -1;
@@ -1028,47 +1459,175 @@ esp_err_t modem_service_poll_unread_sms(char *number, size_t number_len, char *t
     err = ESP_OK;
 
 out:
-    if (s_cs_op_lock) {
-        xSemaphoreGive(s_cs_op_lock);
-    }
+    // s_manual_ppp_suspend = false;
+    // s_cs_session_active = false;
+    // s_cs_session_had_ppp = false;
+    // s_cs_session_start_tick = 0;
+
+    // if (s_cs_op_lock) {
+    //     xSemaphoreGive(s_cs_op_lock);
+    // }
     return err;
 }
 
+esp_err_t modem_service_poll_unread_sms(char *number,
+                                        size_t number_len,
+                                        char *text,
+                                        size_t text_len,
+                                        bool *found)
+{
+    esp_err_t err;
+
+    if (!number || !text || !found || number_len == 0 || text_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    number[0] = '\0';
+    text[0] = '\0';
+    *found = false;
+
+    err = modem_service_begin_cs_session("poll_sms");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "begin poll_sms session failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = modem_poll_unread_sms_command_mode(number,
+                                             number_len,
+                                             text,
+                                             text_len,
+                                             found);
+
+    return modem_service_end_cs_session("poll_sms", err);
+}
+
+// esp_err_t modem_service_delete_all_sms(void)
+// {
+//     char resp[128] = {0};
+
+//     if (!s_dce) {
+//         return ESP_ERR_INVALID_STATE;
+//     }
+
+//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+//         return ESP_ERR_TIMEOUT;
+//     }
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     memset(resp, 0, sizeof(resp));
+//     (void)modem_at_cmd("AT+CMGF=1", resp, sizeof(resp), 3000);
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     (void)modem_prepare_sms_storage(resp, sizeof(resp));
+
+//     uart_flush_input(s_cfg.uart_port);
+//     vTaskDelay(pdMS_TO_TICKS(50));
+
+//     esp_err_t err = modem_at_cmd("AT+CMGD=1,4", resp, sizeof(resp), 5000);
+
+//     xSemaphoreGive(s_cs_op_lock);
+//     return err;
+// }
+
 esp_err_t modem_service_delete_all_sms(void)
 {
-    char resp[128] = {0};
+    char resp[256] = {0};
+    esp_err_t err = ESP_OK;
 
     if (!s_dce) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
+    /*
+     * Dung chung co che CS session:
+     * - Neu dang PPP thi stop PPP truoc
+     * - Neu Ethernet/WiFi thi dung command mode
+     * - Neu AT khong ready thi begin_cs_session tu xu ly recover/reset modem
+     */
+    err = modem_service_begin_cs_session("delete_sms");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "delete_sms: begin CS session failed: %s",
+                 esp_err_to_name(err));
+        return err;
     }
 
     uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
-
-    uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
+    /*
+     * Tat echo, neu fail thi van co the thu tiep CMGF/CPMS.
+     */
     memset(resp, 0, sizeof(resp));
-    (void)modem_at_cmd("AT+CMGF=1", resp, sizeof(resp), 3000);
+    esp_err_t ate_err = modem_at_cmd("ATE0", resp, sizeof(resp), 1500);
+    if (ate_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "delete_sms: ATE0 failed: %s",
+                 esp_err_to_name(ate_err));
+    }
 
     uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    (void)modem_prepare_sms_storage(resp, sizeof(resp));
+    /*
+     * SMS text mode.
+     */
+    memset(resp, 0, sizeof(resp));
+    err = modem_at_cmd("AT+CMGF=1", resp, sizeof(resp), 3000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "delete_sms: AT+CMGF=1 failed: %s",
+                 esp_err_to_name(err));
+
+        return modem_service_end_cs_session("delete_sms", err);
+    }
 
     uart_flush_input(s_cfg.uart_port);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    esp_err_t err = modem_at_cmd("AT+CMGD=1,4", resp, sizeof(resp), 5000);
+    /*
+     * Chon bo nho SMS.
+     * Ham modem_prepare_sms_storage() cua ban da co fallback SM -> MT.
+     */
+    memset(resp, 0, sizeof(resp));
+    err = modem_prepare_sms_storage(resp, sizeof(resp));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "delete_sms: prepare SMS storage failed: %s",
+                 esp_err_to_name(err));
 
-    xSemaphoreGive(s_cs_op_lock);
-    return err;
+        return modem_service_end_cs_session("delete_sms", err);
+    }
+
+    uart_flush_input(s_cfg.uart_port);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /*
+     * Xoa tat ca SMS.
+     * AT+CMGD=1,4: delete all messages from selected storage.
+     */
+    memset(resp, 0, sizeof(resp));
+    err = modem_at_cmd("AT+CMGD=1,4", resp, sizeof(resp), 8000);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "delete_sms: delete all SMS OK");
+    } else {
+        ESP_LOGE(TAG,
+                 "delete_sms: AT+CMGD=1,4 failed: %s resp=[%s]",
+                 esp_err_to_name(err),
+                 resp);
+    }
+
+    return modem_service_end_cs_session("delete_sms", err);
 }
 
 esp_err_t modem_service_get_signal(modem_signal_t *sig)
@@ -1125,4 +1684,13 @@ void modem_service_set_sim_ready(bool ready)
     }
 
     s_sim_card_ready = ready;
+}
+
+bool modem_service_is_busy_too_long(uint32_t timeout_ms)
+{
+    if (!s_cs_session_active || s_cs_session_start_tick == 0) {
+        return false;
+    }
+
+    return (xTaskGetTickCount() - s_cs_session_start_tick) >= pdMS_TO_TICKS(timeout_ms);
 }
