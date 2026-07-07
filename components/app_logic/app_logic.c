@@ -39,6 +39,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include  "tm1638_4G_ui.h"
+#include "net_manager.h"
+
+#define APP_SIM_SERVICE_LOST_RESET_MS     (5UL * 60UL * 1000UL)
+#define APP_SIM_SERVICE_LOST_LOG_MS       60000UL
 
 static const char *TAG = "app_logic";
 
@@ -60,6 +64,12 @@ static void handle_reboot_request_internal(void);
 static bool s_boot_sensor_ready = false;
 #define APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS   60000UL
 static uint8_t s_sms_modem_not_ready_fast_try = 0;
+
+static bool s_sim_ever_ready = false;
+static int64_t s_sim_service_lost_since_ms = 0;
+static int64_t s_sim_service_lost_last_log_ms = 0;
+static bool s_sim_service_reset_pending = false;
+static int64_t s_sim_service_reset_pending_ms = 0;
 
 typedef enum {
     MODEM_JOB_NONE = 0,
@@ -393,6 +403,121 @@ static uint16_t s_telemetry_q_count = 0;
 
 void app_logic_handle_hum_disabled(void);
 
+// static bool app_restart_should_defer(void)
+// {
+//     /*
+//      * Đang modem job SMS/call/poll thì không reset ngay.
+//      */
+//     if (s_modem_busy) {
+//         ESP_LOGW(TAG, "restart deferred: modem job busy");
+//         return true;
+//     }
+
+//     /*
+//      * Đang CS session SMS/call thì không reset ngay.
+//      */
+//     if (modem_service_is_cs_session_active()) {
+//         ESP_LOGW(TAG, "restart deferred: modem CS session active");
+//         return true;
+//     }
+//     return false;
+// }
+
+// static void sim_service_watchdog(void)
+// {
+//     int64_t now_ms = esp_timer_get_time() / 1000;
+
+//     bool sim_ready = modem_service_is_sim_ready();
+
+//     /*
+//      * Nếu SIM/modem ready thì ghi nhận đã từng có SIM OK.
+//      */
+//     if (sim_ready) {
+//         s_sim_ever_ready = true;
+//         s_sim_service_lost_since_ms = 0;
+//         s_sim_service_lost_last_log_ms = 0;
+//         s_sim_service_reset_pending = false;
+//         s_sim_service_reset_pending_ms = 0;
+//         return;
+//     }
+
+//     /*
+//      * Nếu từ lúc boot tới giờ chưa từng thấy SIM ready,
+//      * coi như khách không gắn SIM hoặc SIM chưa có.
+//      * Không reset chỉ vì không có SIM.
+//      */
+//     if (!s_sim_ever_ready) {
+//         return;
+//     }
+
+//     /*
+//      * Nếu trước đó đã yêu cầu reset nhưng đang bận,
+//      * khi hết bận thì reset.
+//      */
+//     if (s_sim_service_reset_pending) {
+//         if (!app_restart_should_defer()) {
+//             int64_t pending_ms = now_ms - s_sim_service_reset_pending_ms;
+
+//             ESP_LOGE(TAG,
+//                      "SIM service pending reset now execute, pending_ms=%lld",
+//                      (long long)pending_ms);
+
+//             vTaskDelay(pdMS_TO_TICKS(500));
+//             esp_restart();
+//         }
+
+//         return;
+//     }
+
+//     /*
+//      * Bắt đầu tính thời gian mất dịch vụ SIM.
+//      */
+//     if (s_sim_service_lost_since_ms == 0) {
+//         s_sim_service_lost_since_ms = now_ms;
+//         s_sim_service_lost_last_log_ms = now_ms;
+
+//         ESP_LOGW(TAG,
+//                  "SIM service lost watchdog started: sim_ever_ready=1");
+//         return;
+//     }
+
+//     int64_t lost_ms = now_ms - s_sim_service_lost_since_ms;
+//     int64_t log_ms = now_ms - s_sim_service_lost_last_log_ms;
+
+//     if (log_ms >= APP_SIM_SERVICE_LOST_LOG_MS) {
+//         s_sim_service_lost_last_log_ms = now_ms;
+
+//         ESP_LOGW(TAG,
+//                  "SIM service lost for %lld ms threshold=%lu ms",
+//                  (long long)lost_ms,
+//                  (unsigned long)APP_SIM_SERVICE_LOST_RESET_MS);
+//     }
+
+//     /*
+//      * Đã từng có SIM ready, nhưng mất SIM/AT service quá lâu.
+//      */
+//     if (lost_ms >= APP_SIM_SERVICE_LOST_RESET_MS) {
+//         ESP_LOGE(TAG,
+//                  "SIM service lost too long -> restart requested lost_ms=%lld",
+//                  (long long)lost_ms);
+
+//         if (app_restart_should_defer()) {
+//             s_sim_service_reset_pending = true;
+//             s_sim_service_reset_pending_ms = now_ms;
+
+//             ESP_LOGW(TAG,
+//                      "SIM service reset pending, wait device idle");
+//             return;
+//         }
+
+//         ESP_LOGE(TAG,
+//                  "SIM service lost too long -> restart MCU to recover SIM service");
+
+//         vTaskDelay(pdMS_TO_TICKS(500));
+//         esp_restart();
+//     }
+// }
+
 static void telemetry_queue_push(const char *payload)
 {
     if (!payload || payload[0] == '\0') {
@@ -427,7 +552,7 @@ static void telemetry_queue_push(const char *payload)
 
 static void telemetry_queue_flush_some(void)
 {
-    if (!s_uplink_ready || !mqtt_service_is_connected()) {
+    if (!mqtt_service_is_connected()) {
         return;
     }
 
@@ -830,7 +955,7 @@ static void publish_sensor_fault_event(const char *sensor,
                                        bool active,
                                        const char *reason)
 {
-    if (!s_uplink_ready || !mqtt_service_is_connected()) {
+    if (!mqtt_service_is_connected()) {
         return;
     }
 
@@ -866,26 +991,9 @@ static void publish_sensor_fault_event(const char *sensor,
     ESP_LOGW(TAG, "sensor event mid=%d payload=%s", mid, payload);
 }
 
-// static void process_sensor_fault_notifications(void)
-// {
-//     if (!s_uplink_ready || !mqtt_service_is_connected()) {
-//         return;
-//     }
-
-//     if (s_ntc_fault_notify_pending) {
-//         publish_sensor_fault_event("ntc", s_ntc_fault_active, s_ntc_fault_reason);
-//         s_ntc_fault_notify_pending = false;
-//     }
-
-//     if (s_sht_fault_notify_pending) {
-//         publish_sensor_fault_event("sht30", s_sht_fault_active, s_sht_fault_reason);
-//         s_sht_fault_notify_pending = false;
-//     }
-// }
-
 static void process_sensor_fault_notifications(void)
 {
-    if (!s_uplink_ready || !mqtt_service_is_connected()) {
+    if ( !mqtt_service_is_connected()) {
         return;
     }
 
@@ -950,12 +1058,43 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
             }
         }
     }
+    // else if (id == APP_EVENT_MQTT_CONNECTED) 
+    // {
+    //     s_last_mqtt_connected_ms = esp_timer_get_time() / 1000;
+    //     tm1638_server_set_state(SERVER_LED_CONNECTED);
+    //     publish_state_internal("mqtt_connected");
+    //       telemetry_queue_flush_some();
+    // } 
     else if (id == APP_EVENT_MQTT_CONNECTED) {
         s_last_mqtt_connected_ms = esp_timer_get_time() / 1000;
+
+        /*
+        * MQTT da connected thi duong mang thuc te dang OK.
+        * Tu chua truong hop app_logic bi stale s_uplink_ready=0.
+        */
+        if (!s_uplink_ready) {
+            ESP_LOGW(TAG,
+                    "MQTT connected while uplink_ready=0 -> force uplink_ready=1, old net=%s",
+                    net_type_to_str_internal(s_net_type));
+
+            s_uplink_ready = true;
+
+            /*
+            * Khong doan net_type neu khong co thong tin chinh xac.
+            * Neu old net la NONE/AP_ONLY thi tam de WIFI, vi MQTT connected thuong den sau WiFi/ETH/PPP up.
+            */
+            if (s_net_type == APP_NET_NONE || s_net_type == APP_NET_AP_ONLY) {
+                s_net_type = APP_NET_WIFI;
+            }
+        }
+
         tm1638_server_set_state(SERVER_LED_CONNECTED);
+
         publish_state_internal("mqtt_connected");
-          telemetry_queue_flush_some();
-    } else if (id == APP_EVENT_MQTT_DISCONNECTED) {
+        telemetry_queue_flush_some();
+    }
+
+    else if (id == APP_EVENT_MQTT_DISCONNECTED) {
         //tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
          bool mqtt_down_for_cs =
             (s_net_type == APP_NET_PPP) &&
@@ -996,35 +1135,6 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
     }
     else if (id == APP_EVENT_NET_DOWN) 
     {
-        // app_net_status_t *st = (app_net_status_t *)data;
-        // bool active_link_down = false;
-        //  /*
-        // * Neu PPP bi down do modem dang vao CS session de poll/gui SMS,
-        // * thi day la gian doan chu dong, khong bao LED server loi.
-        // */
-        // bool ppp_down_for_cs =
-        //     st &&
-        //     st->type == APP_NET_PPP &&
-        //     modem_service_is_cs_session_active();
-
-        // if (st && st->type == s_net_type) {
-        //     active_link_down = true;
-        //     s_uplink_ready = false;
-        // }
-        // if (!st) {
-        //      active_link_down = true;
-        //     s_uplink_ready = false;
-        //     s_net_type = APP_NET_NONE;
-        // }
-
-        // if (mqtt_service_is_connected()) {
-        //     tm1638_server_set_state(SERVER_LED_CONNECTED);
-        // } else if (active_link_down || !s_uplink_ready) {
-        //     tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
-        // }
-        // else if (active_link_down || !s_uplink_ready) {
-        //     tm1638_server_set_state(SERVER_LED_ERROR_BLINK);
-        // }
         app_net_status_t *st = (app_net_status_t *)data;
         bool active_link_down = false;
 
@@ -1040,13 +1150,32 @@ static void app_event_handler(void *arg, esp_event_base_t base, int32_t id, void
 
         if (st && st->type == s_net_type) {
             active_link_down = true;
-            s_uplink_ready = false;
-        }
 
+            /*
+            * Neu MQTT van connected thi khong clear uplink_ready.
+            * Tránh event NET_DOWN cu lam app_logic stale uplink=0 trong khi server LED/MQTT van sang.
+            */
+            if (!mqtt_service_is_connected()) {
+                s_uplink_ready = false;
+                s_net_type = APP_NET_NONE;
+                ESP_LOGW(TAG,
+                    "NET_DOWN type=%s -> clear app_logic net state",
+                    net_type_to_str_internal(st->type));
+            } else {
+                ESP_LOGW(TAG,
+                        "NET_DOWN type=%s but MQTT still connected -> keep uplink_ready=1",
+                        net_type_to_str_internal(st->type));
+            }
+        }
         if (!st) {
             active_link_down = true;
-            s_uplink_ready = false;
-            s_net_type = APP_NET_NONE;
+
+            if (!mqtt_service_is_connected()) {
+                s_uplink_ready = false;
+                s_net_type = APP_NET_NONE;
+            } else {
+                ESP_LOGW(TAG, "NET_DOWN null but MQTT connected -> keep uplink state");
+            }
         }
 
         if (mqtt_service_is_connected()) {
@@ -3100,81 +3229,10 @@ static void modem_task(void *arg)
     }
 }
 
-// static void process_incoming_sms_commands(void)
-// {
-//     int64_t now_ms = esp_timer_get_time() / 1000;
-
-//     bool mqtt_online = s_uplink_ready && mqtt_service_is_connected();
-
-//     /*
-//      * Chi poll thua khi dang dung PPP/4G.
-//      * Ethernet/WiFi thi van poll nhanh vi SMS khong lam mat duong mang chinh.
-//      */
-//     bool ppp_mqtt_online =
-//         mqtt_online &&
-//         (s_net_type == APP_NET_PPP);
-
-//         uint32_t poll_interval_ms = ppp_mqtt_online
-//             ? APP_SMS_COMMAND_POLL_PPP_ONLINE_MS
-//             : APP_SMS_COMMAND_POLL_MS;
-
-//     /*
-//      * MQTT vua connected thi khong poll SMS ngay.
-//      * Neu poll luc nay, poll_sms se stop PPP de vao CS service,
-//      * lam MQTT vua len da bi disconnect.
-//      */
-//     // if (mqtt_online &&
-//     //     s_last_mqtt_connected_ms > 0 &&
-//     //     (now_ms - s_last_mqtt_connected_ms) < APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS) {
-//     //     return;
-//     // }
-
-//     if (ppp_mqtt_online &&
-//         s_last_mqtt_connected_ms > 0 &&
-//         (now_ms - s_last_mqtt_connected_ms) < APP_SMS_POLL_AFTER_MQTT_CONNECTED_MS) {
-//         return;
-//     }
-
-//     if ((now_ms - s_last_sms_command_poll_ms) < poll_interval_ms) {
-//         return;
-//     }
-
-//     if (s_modem_busy) {
-//         if (s_modem_busy_since_ms == 0) {
-//             s_modem_busy_since_ms = now_ms;
-//         }
-
-//         if (modem_service_is_cs_session_active() &&
-//             modem_service_is_busy_too_long(60000)) {
-//             ESP_LOGE(TAG, "modem CS session busy too long -> restart device");
-//             esp_restart();
-//         }
-
-//         if ((now_ms - s_modem_busy_since_ms) > 60000) {
-//             ESP_LOGE(TAG, "app modem busy too long -> restart device");
-//             esp_restart();
-//         }
-
-//         return;
-//     }
-
-//     s_modem_busy_since_ms = 0;
-
-//     if (enqueue_modem_job(MODEM_JOB_POLL_INBOX)) {
-//         s_last_sms_command_poll_ms = now_ms;
-//         ESP_LOGW(TAG,
-//                  "SMS_POLL_QUEUED interval=%lu mqtt_online=%d",
-//                  (unsigned long)poll_interval_ms,
-//                  mqtt_online ? 1 : 0);
-//     } else {
-//         ESP_LOGE(TAG, "SMS_POLL_QUEUE_FAILED");
-//     }
-// }
-
 static void process_incoming_sms_commands(void)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
-
+    static uint8_t s_sms_ppp_offline_delay_count = 0;
     bool mqtt_online = s_uplink_ready && mqtt_service_is_connected();
 
     /*
@@ -3190,15 +3248,6 @@ static void process_incoming_sms_commands(void)
      */
     bool modem_sms_ready = modem_service_is_sim_ready();
 
-    // uint32_t poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
-
-    // if (ppp_context) {
-    //     poll_interval_ms = APP_SMS_COMMAND_POLL_PPP_ONLINE_MS;
-    // } else if (!modem_sms_ready) {
-    //     poll_interval_ms = APP_SMS_COMMAND_POLL_MODEM_NOT_READY_MS;
-    // } else {
-    //     poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
-    // }
     uint32_t poll_interval_ms = APP_SMS_COMMAND_POLL_MS;
 
     if (ppp_context) {
@@ -3253,6 +3302,48 @@ static void process_incoming_sms_commands(void)
 
     s_modem_busy_since_ms = 0;
 
+    /*
+    * Khi PPP vua GOT IP / MQTT dang recover thi khong poll SMS.
+    * Vi poll_sms co the cat PPP, lam MQTT khong kip connected.
+    */
+    if (net_manager_is_ppp_mqtt_recovering()) {
+        s_last_sms_command_poll_ms = now_ms;
+        ESP_LOGW(TAG, "SMS poll delayed: PPP/MQTT recovering");
+        return;
+    }
+
+    /*
+    * Neu dang o PPP context nhung PPP khong co IP va MQTT dang offline,
+    * uu tien de net_manager keo PPP/MQTT lai, khong tiep tuc poll SMS.
+    */
+    if (ppp_context &&
+        !modem_service_is_ip_ready() &&
+        !mqtt_online) {
+
+        if (s_sms_ppp_offline_delay_count < 3) {
+            s_sms_ppp_offline_delay_count++;
+            s_last_sms_command_poll_ms = now_ms;
+
+            ESP_LOGW(TAG,
+                    "SMS poll delayed: PPP has no IP and MQTT offline delay_count=%u",
+                    (unsigned)s_sms_ppp_offline_delay_count);
+            return;
+        }
+
+        /*
+        * Sau vai lan delay, van cho poll SMS de thiet bi con nhan lenh TT/SET.
+        * Sau lan nay reset count de chu ky sau lai uu tien PPP tiep.
+        */
+        s_sms_ppp_offline_delay_count = 0;
+
+        ESP_LOGW(TAG,
+                "SMS poll allowed while PPP offline after delays");
+    }
+    else {
+        s_sms_ppp_offline_delay_count = 0;
+    }
+
+
     if (enqueue_modem_job(MODEM_JOB_POLL_INBOX)) {
         s_last_sms_command_poll_ms = now_ms;
 
@@ -3285,40 +3376,55 @@ static void publish_task(void *arg)
     (void)arg;
 
     char payload[640];
+
     TickType_t last_health = xTaskGetTickCount();
     TickType_t last_sensor = 0;
     TickType_t last_display = 0;
     TickType_t last_blink = 0;
+
+    /*
+     * last_publish: chỉ cập nhật khi publish thật sự thành công.
+     * next_publish_try: dùng để retry sớm khi MQTT offline / CS active / publish fail.
+     * last_publish_skip_log: chống spam log khi MQTT offline.
+     */
     TickType_t last_publish = 0;
+    TickType_t next_publish_try = 0;
+    TickType_t last_publish_skip_log = 0;
 
     const TickType_t loop_tick = pdMS_TO_TICKS(100);
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
+
         if ((now - s_last_rtc_read) >= pdMS_TO_TICKS(APP_RTC_READ_MS)) {
             read_rtc_time();
             s_last_rtc_read = now;
         }
+
         if ((now - s_last_rtc_sync_check) >= pdMS_TO_TICKS(APP_RTC_SYNC_CHECK_MS)) {
             if (s_uplink_ready) {
                 sync_system_time_to_ds1307_once();
             }
             s_last_rtc_sync_check = now;
         }
+
         if ((now - last_health) >= pdMS_TO_TICKS(APP_HEALTH_LOG_MS)) {
-            diag_log_health("periodic", s_uplink_ready, mqtt_service_is_connected(), mqtt_service_get_outbox_size());
+            diag_log_health("periodic",
+                            s_uplink_ready,
+                            mqtt_service_is_connected(),
+                            mqtt_service_get_outbox_size());
+
             publish_state_internal("periodic_health");
             last_health = now;
         }
 
         if ((now - last_sensor) >= pdMS_TO_TICKS(APP_SENSOR_SAMPLE_MS)) {
             sample_sensors();
-            // if (s_ntc1_valid && (!s_runtime_cfg.hum_enabled || s_humidity_valid)) {
-            //     s_boot_sensor_ready = true;
-            // }
+
             if (s_ntc1_valid) {
                 s_boot_sensor_ready = true;
             }
+
             if (!s_power_boot_checked) {
                 power_sample_t sample = {0};
                 power_state_t state = POWER_STATE_UNKNOWN;
@@ -3326,8 +3432,12 @@ static void publish_task(void *arg)
 
                 if (err == ESP_OK) {
                     s_power_boot_checked = true;
-                    ESP_LOGW(TAG, "initial power state=%d main=%.2fV bk=%.2fV",
-                             (int)state, sample.main_v, sample.bk_v);
+
+                    ESP_LOGW(TAG,
+                             "initial power state=%d main=%.2fV bk=%.2fV",
+                             (int)state,
+                             sample.main_v,
+                             sample.bk_v);
 
                     if (state == POWER_STATE_MAIN_LOST) {
                         s_power_lost_sms_pending = true;
@@ -3340,9 +3450,11 @@ static void publish_task(void *arg)
 
                         s_power_lost_last_notify_ms = esp_timer_get_time() / 1000;
                         s_power_lost_notify_count = 1;
+
                         update_do1_output_state();
 
-                        ESP_LOGW(TAG, "boot with main power lost -> queue FIRST power lost SMS, call after SMS");
+                        ESP_LOGW(TAG,
+                                 "boot with main power lost -> queue FIRST power lost SMS, call after SMS");
                     }
                 }
             }
@@ -3354,7 +3466,7 @@ static void publish_task(void *arg)
 
             process_power_lost_sms();
             process_power_restored_sms();
-            
+
             process_daily_health_sms();
 
             process_ntc_fault_sms();
@@ -3362,15 +3474,18 @@ static void publish_task(void *arg)
 
             process_sht_fault_sms();
             process_sht_restored_sms();
+
             process_power_lost_reminder();
 
             process_alarm_call();
             process_alarm_restored_call();
+
             process_power_lost_call();
             process_power_restored_call();
 
             process_incoming_sms_commands();
             process_sensor_fault_notifications();
+
             last_sensor = now;
         }
 
@@ -3380,15 +3495,27 @@ static void publish_task(void *arg)
         }
 
         if ((now - last_display) >= pdMS_TO_TICKS(APP_DISPLAY_REFRESH_MS)) {
-             update_display_brightness_by_power();
+            update_display_brightness_by_power();
             update_display();
             last_display = now;
         }
+
         update_sim_led_from_modem_state();
+
         tm1638_wifi_led_tick_100ms();
         tm1638_server_led_tick_100ms();
         sim_led_tick_100ms();
-        if ((now - last_publish) >= pdMS_TO_TICKS(s_pub_period_ms)) {
+
+        /*
+         * Publish telemetry.
+         *
+         * Điều kiện:
+         * - Đến chu kỳ publish bình thường, hoặc
+         * - Đến thời điểm retry sau khi lần trước bị skip/fail.
+         */
+        if ((now - last_publish) >= pdMS_TO_TICKS(s_pub_period_ms) &&
+            (next_publish_try == 0 || (int32_t)(now - next_publish_try) >= 0)) {
+
             bool di1 = false;
             bool di2 = false;
             bool di3 = false;
@@ -3404,6 +3531,7 @@ static void publish_task(void *arg)
 
             power_sample_t power_sample = {0};
             power_state_t power_state = POWER_STATE_UNKNOWN;
+
             int main_mv = 0;
             int backup_mv = 0;
 
@@ -3416,161 +3544,105 @@ static void publish_task(void *arg)
             float temp2_pub = s_last_temp2_c;
             float temp_sht_pub = s_last_sht30_temp_c;
             float hum_sht_pub = s_runtime_cfg.hum_enabled ? s_last_humidity : 0.0f;
+
             time_t ts_now = time(NULL);
 
-            snprintf(payload, sizeof(payload),
-                    "{\"version\":\"%s\","
+            snprintf(payload,
+                     sizeof(payload),
+                     "{\"version\":\"%s\","
                      "\"ts\":%lld,"
-                    "\"temp1\":%.2f,"
-                    "\"temp2\":%.2f,"
-                    "\"temp_sht\":%.2f,"
-                    "\"hum_sht\":%.2f,"
-                    "\"dienap\":%d,"
-                    "\"u_backup\":%d,"
-                    "\"input1\":%s,"
-                    "\"input2\":%s,"
-                    "\"input3\":%s,"
-                    "\"output1\":%s,"
-                    "\"output2\":%s,"
-                    "\"output3\":%s,"
-                    "\"lat\":0,"
-                    "\"lon\":0}",
-                    APP_FW_VERSION,
+                     "\"temp1\":%.2f,"
+                     "\"temp2\":%.2f,"
+                     "\"temp_sht\":%.2f,"
+                     "\"hum_sht\":%.2f,"
+                     "\"dienap\":%d,"
+                     "\"u_backup\":%d,"
+                     "\"input1\":%s,"
+                     "\"input2\":%s,"
+                     "\"input3\":%s,"
+                     "\"output1\":%s,"
+                     "\"output2\":%s,"
+                     "\"output3\":%s,"
+                     "\"lat\":0,"
+                     "\"lon\":0}",
+                     APP_FW_VERSION,
                      (long long)ts_now,
-                    temp1_pub,
-                    temp2_pub,
-                    temp_sht_pub,
-                    hum_sht_pub,
-                    main_mv,
-                    backup_mv,
-                    di1 ? "true" : "false",
-                    di2 ? "true" : "false",
-                    di3 ? "true" : "false",
-                    do1 ? "true" : "false",
-                    do2 ? "true" : "false",
-                    "false");
+                     temp1_pub,
+                     temp2_pub,
+                     temp_sht_pub,
+                     hum_sht_pub,
+                     main_mv,
+                     backup_mv,
+                     di1 ? "true" : "false",
+                     di2 ? "true" : "false",
+                     di3 ? "true" : "false",
+                     do1 ? "true" : "false",
+                     do2 ? "true" : "false",
+                     "false");
 
             ESP_LOGI(TAG,
-                    "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
-                    di1 ? 1 : 0,
-                    di2 ? 1 : 0,
-                    di3 ? 1 : 0,
-                    do1 ? 1 : 0,
-                    do2 ? 1 : 0,
-                    main_mv,
-                    backup_mv);
+                     "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
+                     di1 ? 1 : 0,
+                     di2 ? 1 : 0,
+                     di3 ? 1 : 0,
+                     do1 ? 1 : 0,
+                     do2 ? 1 : 0,
+                     main_mv,
+                     backup_mv);
 
-            if (s_uplink_ready && mqtt_service_is_connected()) {
-                int mid = mqtt_service_publish_telemetry(payload);
-                ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
+            bool mqtt_online = mqtt_service_is_connected();
+            bool cs_active = modem_service_is_cs_session_active();
 
-                telemetry_queue_flush_some();
+            /*
+             * Không dùng queue:
+             * - Nếu MQTT offline: bỏ payload hiện tại.
+             * - Nếu đang CS session đọc SMS/gọi điện: bỏ payload hiện tại.
+             * - Không cập nhật last_publish.
+             * - Retry sau 5 giây.
+             */
+            if (!mqtt_online || cs_active) {
+                if ((now - last_publish_skip_log) >= pdMS_TO_TICKS(5000)) {
+                    ESP_LOGW(TAG,
+                             "skip publish uplink=%d mqtt=%d cs=%d net=%s payload_lost",
+                             s_uplink_ready ? 1 : 0,
+                             mqtt_online ? 1 : 0,
+                             cs_active ? 1 : 0,
+                             net_type_to_str_internal(s_net_type));
+
+                    last_publish_skip_log = now;
+                }
+
+                next_publish_try = now + pdMS_TO_TICKS(5000);
             } else {
-                ESP_LOGW(TAG,
-                        "queue publish uplink=%d mqtt=%d net=%s payload=%s",
-                        s_uplink_ready ? 1 : 0,
-                        mqtt_service_is_connected() ? 1 : 0,
-                        net_type_to_str_internal(s_net_type),
-                        payload);
+                int mid = mqtt_service_publish_telemetry(payload);
 
-                telemetry_queue_push(payload);
+                ESP_LOGI(TAG,
+                         "publish mid=%d uplink=%d net=%s payload=%s",
+                         mid,
+                         s_uplink_ready ? 1 : 0,
+                         net_type_to_str_internal(s_net_type),
+                         payload);
+
+                if (mid >= 0) {
+                    /*
+                     * Chỉ cập nhật last_publish khi đã gọi publish thành công.
+                     */
+                    last_publish = now;
+                    next_publish_try = 0;
+                    s_publish_count++;
+                } else {
+                    ESP_LOGW(TAG,
+                             "publish failed mid=%d -> retry soon",
+                             mid);
+
+                    /*
+                     * Không cập nhật last_publish.
+                     * Retry sau 5 giây.
+                     */
+                    next_publish_try = now + pdMS_TO_TICKS(5000);
+                }
             }
-
-            last_publish = now;
-            s_publish_count++;
         }
-
-        // if ((now - last_publish) >= pdMS_TO_TICKS(s_pub_period_ms)) {
-        //     if (s_uplink_ready && mqtt_service_is_connected()) {
-        //         bool di1 = false;
-        //         bool di2 = false;
-        //         bool di3 = false;
-        //         bool do1 = false;
-        //         bool do2 = false;
-
-        //         board_tca_read_pin(APP_DI1_TCA_PIN, &di1);
-        //         board_tca_read_pin(APP_DI2_TCA_PIN, &di2);
-        //         board_tca_read_pin(APP_DI3_TCA_PIN, &di3);
-
-        //         board_tca_get_output_pin(APP_DO1_TCA_PIN, &do1);
-        //         board_tca_get_output_pin(APP_DO2_TCA_PIN, &do2);
-
-        //         power_sample_t power_sample = {0};
-        //         power_state_t power_state = POWER_STATE_UNKNOWN;
-        //         int main_mv = 0;
-        //         int backup_mv = 0;
-
-        //         if (power_monitor_get_latest(&power_sample, &power_state) == ESP_OK) {
-        //             main_mv = (int)(power_sample.main_v * 1000.0f);
-        //             backup_mv = (int)(power_sample.bk_v * 1000.0f);
-        //         }
-
-        //         float temp1_pub = s_last_temp1_c;
-        //         float temp2_pub = s_last_temp2_c;
-        //         float temp_sht_pub = s_last_sht30_temp_c;
-            
-        //         // float hum_sht_pub = (s_runtime_cfg.hum_enabled && s_humidity_valid)
-        //         //     ? s_last_humidity : 0.0f;
-        //         // HUM_OFF => gui 0; loi SHT30 => giu gia tri hop le cuoi cung
-        //         float hum_sht_pub = s_runtime_cfg.hum_enabled ? s_last_humidity : 0.0f;
-        //         ESP_LOGI(TAG, "telemetry io: di1=%d di2=%d di3=%d do1=%d do2=%d main=%d backup=%d",
-        //                  di1 ? 1 : 0, di2 ? 1 : 0, di3 ? 1 : 0, do1 ? 1 : 0, do2 ? 1 : 0,
-        //                  main_mv, backup_mv);
-
-        //         snprintf(payload, sizeof(payload),
-        //                  "{\"version\":\"%s\","
-        //                  "\"temp1\":%.2f,"
-        //                  "\"temp2\":%.2f,"
-        //                  "\"temp_sht\":%.2f,"
-        //                  "\"hum_sht\":%.2f,"
-        //                  "\"dienap\":%d,"
-        //                  "\"u_backup\":%d,"
-        //                  "\"input1\":%s,"
-        //                  "\"input2\":%s,"
-        //                  "\"input3\":%s,"
-        //                  "\"output1\":%s,"
-        //                  "\"output2\":%s,"
-        //                  "\"output3\":%s,"
-        //                  "\"lat\":0,"
-        //                  "\"lon\":0}",
-        //                  APP_FW_VERSION,
-        //                  temp1_pub,
-        //                  temp2_pub,
-        //                  temp_sht_pub,
-        //                  hum_sht_pub,
-        //                  main_mv,
-        //                  backup_mv,
-        //                  di1 ? "true" : "false",
-        //                  di2 ? "true" : "false",
-        //                  di3 ? "true" : "false",
-        //                  do1 ? "true" : "false",
-        //                  do2 ? "true" : "false",
-        //                  "false");
-
-        //         // int mid = mqtt_service_publish_telemetry(payload);
-        //         // ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
-        //         //  telemetry_queue_flush_some();
-        //     if (s_uplink_ready && mqtt_service_is_connected()) {
-        //         int mid = mqtt_service_publish_telemetry(payload);
-        //         ESP_LOGI(TAG, "publish mid=%d payload=%s", mid, payload);
-
-        //         telemetry_queue_flush_some();
-        //     }
-
-        //     } else {
-        //         ESP_LOGW(TAG,
-        //                 "queue publish uplink=%d mqtt=%d net=%s payload=%s",
-        //                 s_uplink_ready ? 1 : 0,
-        //                 mqtt_service_is_connected() ? 1 : 0,
-        //                 net_type_to_str_internal(s_net_type),
-        //                 payload);
-
-        //         telemetry_queue_push(payload);
-        //     }
-
-        //     last_publish = now;
-        //     s_publish_count++;
-        // }
 
         vTaskDelay(loop_tick);
     }

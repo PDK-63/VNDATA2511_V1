@@ -21,6 +21,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
 static const char *TAG = "modem_service";
 static char s_sms_resp_buf[2048];
@@ -71,6 +72,82 @@ static volatile bool s_sim_card_ready = false;
 static TickType_t s_cs_session_start_tick = 0;
 static uint8_t s_cs_at_sync_fail_count = 0;
 
+static volatile bool s_ppp_restart_pending_after_cs = false;
+
+static uint8_t s_cpin_fail_count = 0;
+
+static portMUX_TYPE s_recovery_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool s_recovery_at_seen_this_boot = false;
+static TickType_t s_recovery_last_at_ok_tick = 0;
+
+static bool s_recovery_sim_seen_this_boot = false;
+static modem_recovery_sim_state_t s_recovery_sim_state = MODEM_RECOVERY_SIM_UNKNOWN;
+static TickType_t s_recovery_last_sim_ready_tick = 0;
+
+static void modem_recovery_mark_at_ok(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    portENTER_CRITICAL(&s_recovery_mux);
+    s_recovery_at_seen_this_boot = true;
+    s_recovery_last_at_ok_tick = now;
+    portEXIT_CRITICAL(&s_recovery_mux);
+}
+
+static void modem_recovery_mark_sim_ready(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    portENTER_CRITICAL(&s_recovery_mux);
+    s_recovery_at_seen_this_boot = true;
+    s_recovery_last_at_ok_tick = now;
+
+    s_recovery_sim_seen_this_boot = true;
+    s_recovery_sim_state = MODEM_RECOVERY_SIM_PRESENT;
+    s_recovery_last_sim_ready_tick = now;
+    portEXIT_CRITICAL(&s_recovery_mux);
+}
+
+static void modem_recovery_mark_sim_absent(void)
+{
+    /*
+     * Quan trong:
+     * - Neu tu dau boot khong co SIM:
+     *      sim_seen_this_boot van = false
+     *      app_recovery se KHONG reset vi SIM.
+     *
+     * - Neu truoc do da tung CPIN READY:
+     *      sim_seen_this_boot van = true
+     *      sim_state = ABSENT
+     *      app_recovery co the tinh mat dich vu SIM.
+     */
+    portENTER_CRITICAL(&s_recovery_mux);
+    s_recovery_sim_state = MODEM_RECOVERY_SIM_ABSENT;
+    portEXIT_CRITICAL(&s_recovery_mux);
+}
+
+void modem_service_get_recovery_status(modem_recovery_status_t *out)
+{
+    if (!out) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    portENTER_CRITICAL(&s_recovery_mux);
+    out->at_seen_this_boot = s_recovery_at_seen_this_boot;
+    out->last_at_ok_tick = s_recovery_last_at_ok_tick;
+
+    out->sim_seen_this_boot = s_recovery_sim_seen_this_boot;
+    out->sim_state = s_recovery_sim_state;
+    out->last_sim_ready_tick = s_recovery_last_sim_ready_tick;
+    portEXIT_CRITICAL(&s_recovery_mux);
+
+    out->ip_ready = modem_service_is_ip_ready();
+    out->cs_session_active = modem_service_is_cs_session_active();
+}
+
 static esp_err_t modem_poll_unread_sms_command_mode(char *number,
                                                     size_t number_len,
                                                     char *text,
@@ -101,7 +178,7 @@ static esp_err_t modem_at_cmd(const char *cmd, char *out, size_t out_sz, uint32_
         ESP_LOGW(TAG, "AT failed cmd=%s err=%s", cmd, esp_err_to_name(err));
         return err;
     }
-
+    modem_recovery_mark_at_ok();
     if (out && out_sz > 0) {
         ESP_LOGI(TAG, "AT %s => %s", cmd, out);
     } else {
@@ -128,11 +205,39 @@ static esp_err_t modem_wait_ready_for_ppp(void)
 
         if (modem_at_cmd("AT+CPIN?", buf, sizeof(buf), 3000) == ESP_OK) {
             sim_ready = str_has(buf, "READY");
+            s_cpin_fail_count = 0;
             modem_service_set_sim_ready(sim_ready);
+             if (sim_ready) {
+                /*
+                * Da xac nhan SIM READY trong lan boot nay.
+                * Tu luc nay app_recovery moi tinh watchdog mat dich vu SIM.
+                */
+                modem_recovery_mark_sim_ready();
+            } else {
+                /*
+                * CPIN tra loi thanh cong nhung khong READY.
+                * Neu truoc do da tung READY, app_recovery se tinh la SIM service lost.
+                * Neu tu dau boot chua tung READY, se KHONG reset vi SIM.
+                */
+                modem_recovery_mark_sim_absent();
+            }
+
         } else {
             sim_ready = false;
-            modem_service_set_sim_ready(false);
+
+            if (s_cpin_fail_count < 255) {
+                s_cpin_fail_count++;
+            }
+
+            if (s_cpin_fail_count >= 3) {
+                modem_service_set_sim_ready(false);
+            } else {
+                ESP_LOGW(TAG,
+                        "CPIN fail count=%u, keep old SIM ready state",
+                        (unsigned)s_cpin_fail_count);
+            }
         }
+
         if (modem_at_cmd("AT+CSQ", buf, sizeof(buf), 2000) == ESP_OK) {
             int rssi = -1, ber = -1;
             if (sscanf(buf, "%*[^:]: %d,%d", &rssi, &ber) == 2) {
@@ -177,6 +282,7 @@ static esp_err_t modem_sync_with_recover(void)
         if (err == ESP_OK) {
             s_sync_fail_streak = 0;
             ESP_LOGI(TAG, "sync ok");
+            modem_recovery_mark_at_ok();
             return ESP_OK;
         }
 
@@ -418,9 +524,16 @@ esp_err_t modem_service_stop_ppp(void)
         return ESP_OK;
     }
 
-    s_state = MODEM_STATE_OFF;
     modem_escape_data_mode_uart(s_cfg.uart_port);
-    return esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+
+    esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+    if (err == ESP_OK) {
+        s_state = MODEM_STATE_RUNNING;
+    } else {
+        s_state = MODEM_STATE_RECOVERING;
+    }
+
+    return err;
 }
 
 bool modem_service_is_ip_ready(void)
@@ -446,6 +559,7 @@ bool modem_service_is_cs_session_active(void)
 static esp_err_t modem_service_begin_cs_session(const char *name)
 {
     const char *session_name = name ? name : "cs";
+    esp_err_t err = ESP_OK;
 
     if (!s_dce) {
         return ESP_ERR_INVALID_STATE;
@@ -461,17 +575,20 @@ static esp_err_t modem_service_begin_cs_session(const char *name)
     s_cs_session_start_tick = xTaskGetTickCount();
 
     /*
-     * Chi stop PPP neu truoc do modem that su dang chay PPP/DATA.
+     * Chỉ coi là có PPP nếu modem thật sự đang ở data/wait IP
+     * hoặc đang có PPP IP.
+     *
+     * Không dùng MODEM_STATE_RUNNING ở đây.
+     * RUNNING thường là command mode ready, không phải PPP.
      */
     s_cs_session_had_ppp =
         modem_service_is_ip_ready() ||
         (s_state == MODEM_STATE_DATA) ||
-        (s_state == MODEM_STATE_WAIT_IP) ||
-        (s_state == MODEM_STATE_RUNNING);
+        (s_state == MODEM_STATE_WAIT_IP);
 
     bool need_restart_ppp = s_cs_session_had_ppp;
 
-    if (s_cs_session_had_ppp) {
+    if (need_restart_ppp) {
         s_manual_ppp_suspend = true;
 
         ESP_LOGW(TAG, "%s: stop PPP before CS service", session_name);
@@ -480,44 +597,43 @@ static esp_err_t modem_service_begin_cs_session(const char *name)
 
         if (stop_err != ESP_OK) {
             ESP_LOGW(TAG,
-                     "%s: stop PPP failed: %s, try continue CS sync",
+                     "%s: stop PPP failed: %s, continue CS sync",
                      session_name,
                      esp_err_to_name(stop_err));
-
-            /*
-             * Khong return ngay.
-             * Co truong hop PPP dang mat IP / dang closing,
-             * stop PPP tra loi, nhung modem van co the quay lai AT.
-             */
         }
 
+        /*
+         * Đợi modem thoát PPP/data mode về command mode.
+         */
         vTaskDelay(pdMS_TO_TICKS(1500));
     } else {
-        /*
-         * Dang dung Ethernet/WiFi hoac modem idle command mode:
-         * khong stop PPP, khong manual suspend.
-         */
         s_manual_ppp_suspend = false;
 
-        ESP_LOGI(TAG, "%s: no PPP active, use command mode", session_name);
+        ESP_LOGI(TAG,
+                 "%s: no PPP active, use command mode state=%d ip=%d",
+                 session_name,
+                 (int)s_state,
+                 modem_service_is_ip_ready() ? 1 : 0);
     }
-    esp_err_t err = modem_wait_for_at_ready(15000);
+
+    err = modem_wait_for_at_ready(15000);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s: sync before CS service failed: %s",
-                session_name,
-                esp_err_to_name(err));
+        ESP_LOGE(TAG,
+                 "%s: sync before CS service failed: %s",
+                 session_name,
+                 esp_err_to_name(err));
 
         s_cs_at_sync_fail_count++;
 
         ESP_LOGE(TAG,
-                "%s: CS AT sync fail count=%u",
-                session_name,
-                (unsigned)s_cs_at_sync_fail_count);
+                 "%s: CS AT sync fail count=%u",
+                 session_name,
+                 (unsigned)s_cs_at_sync_fail_count);
 
         /*
-        * Clear CS session/busy truoc, khong de app bi ket modem busy.
-        */
+         * Clear CS session/busy trước, tuyệt đối không để app kẹt modem busy.
+         */
         s_manual_ppp_suspend = false;
         s_cs_session_active = false;
         s_cs_session_had_ppp = false;
@@ -526,26 +642,26 @@ static esp_err_t modem_service_begin_cs_session(const char *name)
         xSemaphoreGive(s_cs_op_lock);
 
         /*
-        * Neu truoc do dang co PPP, thu restart PPP lai.
-        */
+         * Không restart PPP trực tiếp tại đây.
+         * Lý do:
+         * - Nếu WiFi đã quay lại, không cần PPP nữa.
+         * - Nếu SIM hết data/sóng yếu, restart PPP có thể kéo lỗi dài hơn.
+         * - net_manager mới là nơi nên quyết định dùng WiFi hay PPP.
+         */
         if (need_restart_ppp) {
-            ESP_LOGW(TAG, "%s: AT sync failed -> try restart PPP", session_name);
-
-            esp_err_t restart_err = modem_service_restart_ppp();
-            if (restart_err != ESP_OK) {
-                ESP_LOGE(TAG, "%s: restart PPP after AT sync failed: %s",
-                        session_name,
-                        esp_err_to_name(restart_err));
-            }
+            s_ppp_restart_pending_after_cs = true;
+            ESP_LOGW(TAG,
+                     "%s: AT sync failed after PPP suspend -> leave PPP recovery to net_manager",
+                     session_name);
         } else {
             /*
-            * Dang Ethernet/WiFi, khong co PPP de restart.
-            * Neu modem lien tuc khong tra loi AT thi power cycle modem.
-            */
+             * Không có PPP mà AT fail nhiều lần:
+             * modem thật sự kẹt command mode.
+             */
             if (s_cs_at_sync_fail_count >= 2) {
                 ESP_LOGE(TAG,
-                        "%s: AT sync failed too many times without PPP -> power cycle modem",
-                        session_name);
+                         "%s: AT sync failed too many times without PPP -> power cycle modem",
+                         session_name);
 
                 s_cs_at_sync_fail_count = 0;
 
@@ -554,9 +670,9 @@ static esp_err_t modem_service_begin_cs_session(const char *name)
                 esp_err_t reset_err = board_modem_power_cycle();
                 if (reset_err != ESP_OK) {
                     ESP_LOGE(TAG,
-                            "%s: modem power cycle failed: %s",
-                            session_name,
-                            esp_err_to_name(reset_err));
+                             "%s: modem power cycle failed: %s",
+                             session_name,
+                             esp_err_to_name(reset_err));
                 } else {
                     ESP_LOGW(TAG, "%s: modem power cycle done", session_name);
                 }
@@ -573,41 +689,6 @@ static esp_err_t modem_service_begin_cs_session(const char *name)
 
     s_cs_at_sync_fail_count = 0;
     return ESP_OK;
-    // esp_err_t err = modem_wait_for_at_ready(15000);
-
-    // if (err != ESP_OK) {
-    //     ESP_LOGE(TAG, "%s: sync before CS service failed: %s",
-    //              session_name,
-    //              esp_err_to_name(err));
-
-    //     /*
-    //      * Clear CS session/busy truoc, khong de app bi ket modem busy.
-    //      */
-    //     s_manual_ppp_suspend = false;
-    //     s_cs_session_active = false;
-    //     s_cs_session_had_ppp = false;
-    //     s_cs_session_start_tick = 0;
-
-    //     xSemaphoreGive(s_cs_op_lock);
-
-    //     /*
-    //      * Neu truoc do dang co PPP, thu restart PPP lai.
-    //      */
-    //     if (need_restart_ppp) {
-    //         ESP_LOGW(TAG, "%s: AT sync failed -> try restart PPP", session_name);
-
-    //         esp_err_t restart_err = modem_service_restart_ppp();
-    //         if (restart_err != ESP_OK) {
-    //             ESP_LOGE(TAG, "%s: restart PPP after AT sync failed: %s",
-    //                      session_name,
-    //                      esp_err_to_name(restart_err));
-    //         }
-    //     }
-
-    //     return err;
-    // }
-
-    // return ESP_OK;
 }
 
 static esp_err_t modem_service_end_cs_session(const char *name, esp_err_t op_err)
@@ -616,16 +697,13 @@ static esp_err_t modem_service_end_cs_session(const char *name, esp_err_t op_err
     esp_err_t result = op_err;
 
     /*
-     * Lưu lại việc trước đó có PPP hay không.
-     * Sau đó phải clear busy TRƯỚC khi restart PPP.
+     * Ghi nhớ trước đó CS session có suspend PPP hay không.
      */
     bool need_restart_ppp = s_cs_session_had_ppp;
 
     /*
-     * Quan trọng:
-     * Không được giữ s_cs_session_active trong lúc restart PPP.
-     * Nếu SIM không có 4G / hết data, restart PPP có thể fail lâu,
-     * làm TT/alarm SMS bị chặn mãi.
+     * Clear toàn bộ CS/busy state TRƯỚC.
+     * Không được restart PPP khi vẫn giữ CS active/lock.
      */
     s_manual_ppp_suspend = false;
     s_cs_session_active = false;
@@ -637,17 +715,19 @@ static esp_err_t modem_service_end_cs_session(const char *name, esp_err_t op_err
     ESP_LOGW(TAG, "%s: CS session ended, modem busy cleared", session_name);
 
     if (need_restart_ppp) {
-        ESP_LOGW(TAG, "%s: restart PPP after CS service", session_name);
+        /*
+         * Không restart PPP trực tiếp ở đây.
+         * Chỉ đánh dấu để net_manager/modem task xử lý sau.
+         */
+        s_ppp_restart_pending_after_cs = true;
 
-        esp_err_t restart_err = modem_service_restart_ppp();
-
-        if (restart_err != ESP_OK) {
-            ESP_LOGE(TAG, "%s: restart PPP failed: %s",
-                     session_name, esp_err_to_name(restart_err));
-
-        }
+        ESP_LOGW(TAG,
+                 "%s: PPP restart pending after CS service",
+                 session_name);
     } else {
-        ESP_LOGI(TAG, "%s: no PPP before CS service, keep command mode", session_name);
+        ESP_LOGI(TAG,
+                 "%s: no PPP before CS service, keep command mode",
+                 session_name);
     }
 
     return result;
@@ -659,9 +739,6 @@ static esp_err_t modem_send_sms_command_mode(const char *number, const char *tex
     char cmd[96];
     esp_err_t err = ESP_FAIL;
 
-    // if (!s_dce || !number || !text) {
-    //     return ESP_ERR_INVALID_ARG;
-    // }
     if (!s_dce || !number || !text || number[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -878,38 +955,6 @@ esp_err_t modem_service_start_call(const char *number)
     return modem_service_end_cs_session("start_call", err);
 }
 
-// esp_err_t modem_service_hangup(void)
-// {
-//     char resp[256] = {0};
-
-//     if (!s_dce) {
-//         return ESP_ERR_INVALID_STATE;
-//     }
-
-//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-//         return ESP_ERR_TIMEOUT;
-//     }
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     esp_err_t err = modem_at_cmd("ATH", resp, sizeof(resp), 3000);
-//     if (err != ESP_OK) {
-//         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
-//         memset(resp, 0, sizeof(resp));
-//         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 3000);
-//     }
-
-//     if (err == ESP_OK) {
-//         ESP_LOGI(TAG, "voice call ended");
-//     } else {
-//         ESP_LOGE(TAG, "hangup failed");
-//     }
-
-//     xSemaphoreGive(s_cs_op_lock);
-//     return err;
-// }
-
 static esp_err_t modem_hangup_command_mode(void)
 {
     char resp[256] = {0};
@@ -955,70 +1000,6 @@ esp_err_t modem_service_hangup(void)
 
     return modem_service_end_cs_session("hangup", err);
 }
-
-// esp_err_t modem_service_make_call(const char *number, uint32_t duration_ms)
-// {
-//     char resp[512] = {0};
-//     char cmd[96];
-//     esp_err_t err = ESP_FAIL;
-
-//     if (!s_dce || !number || !number[0]) {
-//         return ESP_ERR_INVALID_ARG;
-//     }
-
-//     if (duration_ms < 5000) {
-//         duration_ms = 5000;
-//     }
-
-//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-//         return ESP_ERR_TIMEOUT;
-//     }
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     memset(resp, 0, sizeof(resp));
-//     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     snprintf(cmd, sizeof(cmd), "ATD%s;", number);
-//     memset(resp, 0, sizeof(resp));
-//     err = modem_at_cmd(cmd, resp, sizeof(resp), 10000);
-//     if (err != ESP_OK) {
-//         ESP_LOGE(TAG, "dial failed: %s", esp_err_to_name(err));
-//         goto out_call;
-//     }
-
-//     ESP_LOGI(TAG, "voice call dialing to %s", number);
-
-//     vTaskDelay(pdMS_TO_TICKS(duration_ms));
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     memset(resp, 0, sizeof(resp));
-//     err = modem_at_cmd("ATH", resp, sizeof(resp), 5000);
-//     if (err != ESP_OK) {
-//         ESP_LOGW(TAG, "hangup with ATH failed, try AT+CHUP");
-//         memset(resp, 0, sizeof(resp));
-//         err = modem_at_cmd("AT+CHUP", resp, sizeof(resp), 5000);
-//         if (err != ESP_OK) {
-//             ESP_LOGE(TAG, "hangup failed");
-//             goto out_call;
-//         }
-//     }
-
-//     ESP_LOGI(TAG, "voice call ended");
-//     err = ESP_OK;
-
-// out_call:
-//     if (s_cs_op_lock) {
-//         xSemaphoreGive(s_cs_op_lock);
-//     }
-//     return err;
-// }
 
 static esp_err_t modem_make_call_command_mode(const char *number, uint32_t duration_ms)
 {
@@ -1115,9 +1096,34 @@ static bool modem_sms_ready(void)
         return false;
     }
 
+    // if (modem_at_cmd("AT+CPIN?", resp, sizeof(resp), 3000) == ESP_OK) {
+    //     sim_ready = (strstr(resp, "READY") != NULL);
+    //     modem_service_set_sim_ready(sim_ready);
+
+    //     ESP_LOGI(TAG, "CPIN resp: %s", resp);
+
+    // } else {
+    //     if (s_state == MODEM_STATE_DATA ||
+    //         s_state == MODEM_STATE_WAIT_IP ||
+    //         s_state == MODEM_STATE_RUNNING) {
+
+    //         ESP_LOGW(TAG, "AT+CPIN? failed in PPP/DATA mode, keep SIM ready state");
+    //     } else {
+    //         modem_service_set_sim_ready(false);
+    //     }
+
+    //     ESP_LOGW(TAG, "AT+CPIN? failed");
+    //     return false;
+    // }
     if (modem_at_cmd("AT+CPIN?", resp, sizeof(resp), 3000) == ESP_OK) {
         sim_ready = (strstr(resp, "READY") != NULL);
         modem_service_set_sim_ready(sim_ready);
+
+        if (sim_ready) {
+            modem_recovery_mark_sim_ready();
+        } else {
+            modem_recovery_mark_sim_absent();
+        }
 
         ESP_LOGI(TAG, "CPIN resp: %s", resp);
 
@@ -1129,11 +1135,19 @@ static bool modem_sms_ready(void)
             ESP_LOGW(TAG, "AT+CPIN? failed in PPP/DATA mode, keep SIM ready state");
         } else {
             modem_service_set_sim_ready(false);
+
+            /*
+            * Chi danh dau SIM lost/absent khi khong o DATA/PPP mode.
+            * Neu tu dau boot khong co SIM thi app_recovery van khong reset vi SIM,
+            * vi sim_seen_this_boot van false.
+            */
+            modem_recovery_mark_sim_absent();
         }
 
         ESP_LOGW(TAG, "AT+CPIN? failed");
         return false;
     }
+
     memset(resp, 0, sizeof(resp));
     if (modem_at_cmd("AT+CEREG?", resp, sizeof(resp), 3000) == ESP_OK) {
         int n = 0, stat = 0;
@@ -1278,12 +1292,6 @@ static esp_err_t modem_poll_unread_sms_command_mode(char *number, size_t number_
     *found = false;
     number[0] = 0;
     text[0] = 0;
-
-    // if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
-    //     return ESP_ERR_TIMEOUT;
-    // }
-    // s_cs_session_active = true;
-    // s_cs_session_start_tick = xTaskGetTickCount();
 
     memset(resp, 0, sizeof(s_sms_resp_buf));
 
@@ -1488,7 +1496,9 @@ esp_err_t modem_service_poll_unread_sms(char *number,
 
     err = modem_service_begin_cs_session("poll_sms");
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "begin poll_sms session failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG,
+                 "begin poll_sms session failed: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
@@ -1498,45 +1508,14 @@ esp_err_t modem_service_poll_unread_sms(char *number,
                                              text_len,
                                              found);
 
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "poll_sms command mode failed: %s",
+                 esp_err_to_name(err));
+    }
+
     return modem_service_end_cs_session("poll_sms", err);
 }
-
-// esp_err_t modem_service_delete_all_sms(void)
-// {
-//     char resp[128] = {0};
-
-//     if (!s_dce) {
-//         return ESP_ERR_INVALID_STATE;
-//     }
-
-//     if (!s_cs_op_lock || xSemaphoreTake(s_cs_op_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-//         return ESP_ERR_TIMEOUT;
-//     }
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     (void)modem_at_cmd("ATE0", resp, sizeof(resp), 1000);
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     memset(resp, 0, sizeof(resp));
-//     (void)modem_at_cmd("AT+CMGF=1", resp, sizeof(resp), 3000);
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     (void)modem_prepare_sms_storage(resp, sizeof(resp));
-
-//     uart_flush_input(s_cfg.uart_port);
-//     vTaskDelay(pdMS_TO_TICKS(50));
-
-//     esp_err_t err = modem_at_cmd("AT+CMGD=1,4", resp, sizeof(resp), 5000);
-
-//     xSemaphoreGive(s_cs_op_lock);
-//     return err;
-// }
 
 esp_err_t modem_service_delete_all_sms(void)
 {
@@ -1670,11 +1649,6 @@ bool modem_service_is_sim_ready(void)
     return s_sim_card_ready;
 }
 
-// void modem_service_set_sim_ready(bool ready)
-// {
-//     s_sim_card_ready = ready;
-// }
-
 void modem_service_set_sim_ready(bool ready)
 {
     if (s_sim_card_ready != ready) {
@@ -1684,6 +1658,9 @@ void modem_service_set_sim_ready(bool ready)
     }
 
     s_sim_card_ready = ready;
+    if (ready) {
+        modem_recovery_mark_sim_ready();
+    }
 }
 
 bool modem_service_is_busy_too_long(uint32_t timeout_ms)
@@ -1693,4 +1670,11 @@ bool modem_service_is_busy_too_long(uint32_t timeout_ms)
     }
 
     return (xTaskGetTickCount() - s_cs_session_start_tick) >= pdMS_TO_TICKS(timeout_ms);
+}
+
+bool modem_service_take_ppp_restart_pending_after_cs(void)
+{
+    bool pending = s_ppp_restart_pending_after_cs;
+    s_ppp_restart_pending_after_cs = false;
+    return pending;
 }

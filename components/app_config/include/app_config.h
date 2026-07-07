@@ -6,7 +6,7 @@
 #include "driver/adc.h"
 
 #define APP_PROJECT_NAME                 "Fw_Basevn2411_prod"
-#define APP_FW_VERSION                   "1.0.0"
+#define APP_FW_VERSION                   "1.0.4"
 
 #define APP_DEVICE_ID                    "2511"
 #define APP_TOPIC_PREFIX                 "VN2402"
@@ -90,7 +90,7 @@
 
 /* Wi-Fi provisioning / AP */
 #define APP_WIFI_AP_SSID                 "VN2511_SETUP"
-#define APP_WIFI_AP_PASS                 "12345678"
+#define APP_WIFI_AP_PASS                 ""
 #define APP_WIFI_AP_CHANNEL              1
 #define APP_WIFI_AP_MAX_CONN             4
 #define APP_WIFI_AP_IP                   "192.168.4.1"

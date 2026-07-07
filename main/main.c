@@ -18,6 +18,7 @@
 #include "modem_status.h"
 #include "status_led.h"
 #include "sd_logger.h"
+#include "app_recovery.h"
 
 static const char *TAG = "main";
 
@@ -79,9 +80,12 @@ void app_main(void)
         ESP_LOGW(TAG, "sd_logger_start failed: %s", esp_err_to_name(sd_err));
     }
     ESP_ERROR_CHECK(net_manager_init());
+    ESP_ERROR_CHECK(app_recovery_init());
+
     ESP_ERROR_CHECK(system_supervisor_start());
     ESP_ERROR_CHECK(net_manager_start());
-
+    ESP_ERROR_CHECK(app_recovery_start());
+    
     ESP_LOGI(TAG, "%s started, device_id=%s", APP_PROJECT_NAME, APP_DEVICE_ID);
 }
 
