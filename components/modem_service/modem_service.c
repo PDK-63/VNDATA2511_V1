@@ -1575,7 +1575,6 @@ esp_err_t modem_service_delete_all_sms(void)
 
     /*
      * Chon bo nho SMS.
-     * Ham modem_prepare_sms_storage() cua ban da co fallback SM -> MT.
      */
     memset(resp, 0, sizeof(resp));
     err = modem_prepare_sms_storage(resp, sizeof(resp));

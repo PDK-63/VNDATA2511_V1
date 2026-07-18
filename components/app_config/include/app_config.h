@@ -70,9 +70,9 @@
 #define APP_WIFI_RECHECK_FROM_4G_MS      (60 * 1000UL)
 
 /* MQTT */
-#define APP_MQTT_URI                      "mqtt://giamsatnhietdo.vn:1883"                             // "mqtts://broker.hivemq.com:8883"
-#define APP_MQTT_USERNAME                "mqtt"
-#define APP_MQTT_PASSWORD                "giamsatnhietdo@123"
+#define APP_MQTT_URI                      "mqtt://103.149.29.8:1883"                             // "mqtts://broker.hivemq.com:8883"
+#define APP_MQTT_USERNAME                "device"
+#define APP_MQTT_PASSWORD                "123456"
 #define APP_MQTT_KEEPALIVE_SEC           30
 
 #define APP_MQTT_TOPIC_STATUS_FMT        "%s/%s/statuss"

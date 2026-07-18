@@ -284,14 +284,6 @@ static void enter_provision_mode_now(const char *reason)
     s_wifi_retry_due_tick = 0;
     s_wifi_settle_deadline_tick = 0;
 
-    /*
-     * Neu ban co cac bien nay trong ban moi thi clear luon:
-     */
-    // s_wifi_retry_from_4g_tick = 0;
-    // s_wifi_connect_start_tick = 0;
-    // s_wifi_online_since_tick = 0;
-    // s_wifi_lost_tick = 0;
-    // s_mqtt_retry_due_tick = 0;
 
     tm1638_wifi_set_state(WIFI_LED_CONFIG_MODE);
 
