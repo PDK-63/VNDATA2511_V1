@@ -30,6 +30,26 @@ typedef struct {
     bool valid;
 } modem_signal_t;
 
+typedef enum {
+    MODEM_RECOVERY_SIM_UNKNOWN = 0,
+    MODEM_RECOVERY_SIM_ABSENT,
+    MODEM_RECOVERY_SIM_PRESENT,
+} modem_recovery_sim_state_t;
+
+typedef struct {
+    bool at_seen_this_boot;
+    TickType_t last_at_ok_tick;
+
+    bool sim_seen_this_boot;
+    modem_recovery_sim_state_t sim_state;
+    TickType_t last_sim_ready_tick;
+
+    bool ip_ready;
+    bool cs_session_active;
+} modem_recovery_status_t;
+
+void modem_service_get_recovery_status(modem_recovery_status_t *out);
+
 bool modem_service_is_sim_ready(void);
 void modem_service_set_sim_ready(bool ready);
 
@@ -50,3 +70,5 @@ bool modem_service_should_auto_restart_ppp(void);
 bool modem_service_is_cs_session_active(void);
 esp_err_t modem_service_delete_all_sms(void);
 
+bool modem_service_is_busy_too_long(uint32_t timeout_ms);
+bool modem_service_take_ppp_restart_pending_after_cs(void);

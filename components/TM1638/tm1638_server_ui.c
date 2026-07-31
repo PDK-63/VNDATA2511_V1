@@ -36,8 +36,13 @@ void tm1638_server_set_state(server_led_state_t state)
     s_tick = 0;
     s_blink_on = false;
 
-    ESP_LOGI(TAG, "server led state=%d", (int)state);
-
+    // ESP_LOGI(TAG, "server led state=%d", (int)state);
+    ESP_LOGI(TAG, "server led state=%s(%d)",
+         state == SERVER_LED_CONNECTED ? "CONNECTED" :
+         state == SERVER_LED_ERROR_BLINK ? "ERROR_BLINK" :
+         state == SERVER_LED_OFF ? "OFF" : "UNKNOWN",
+         (int)state);
+         
     switch (s_state) {
     case SERVER_LED_CONNECTED:
         apply_led8(TM1638_LED8_GREEN);
