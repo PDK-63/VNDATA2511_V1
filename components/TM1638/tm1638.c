@@ -176,7 +176,6 @@ static esp_err_t tm_write_segment_plane(tm1638_t *dev, uint8_t plane, uint8_t di
 
 //         /*
 //          * address le: LED don i
-//          * Board cua ban dang dung data 0x02 de bat LED.
 //          */
 //         uint8_t led_data = (dev->led_mask & (1U << i)) ? 0x02 : 0x00;
 //         tm_write_byte(dev, led_data);

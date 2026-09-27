@@ -5,13 +5,9 @@
 static const char *TAG = "sim_led";
 
 /*
- * LED SIM tren TM1638.
- * Theo thong tin ban noi truoc do: LED o index 6.
- *
+
  * Luu y:
  * - Driver tm1638_set_led(dev, led, on) dang dung index 0-based.
- * - Neu ban noi "LED so 6 tu trai qua phai" thi index co the la 5.
- * - Neu ban da test va dung la index 6 thi giu nguyen.
  */
 #define SIM_LED_DEFAULT_INDEX   6
 

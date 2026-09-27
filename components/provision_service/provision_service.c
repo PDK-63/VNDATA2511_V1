@@ -28,6 +28,17 @@ static bool s_running = false;
 #define APP_PROVISION_SCAN_MAX_AP 20
 #endif
 
+esp_err_t provision_service_restart(void)
+{
+    ESP_LOGW(TAG, "force restart provision service");
+
+    provision_service_stop();
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    return provision_service_start();
+}
+
 static void apply_wifi_config_task(void *arg)
 {
     (void)arg;
@@ -82,7 +93,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "   hint.textContent='Quet that bai.';"
         " }"
         "}"
-        "window.addEventListener('load', function(){ scanWifi(); });"
+        //"window.addEventListener('load', function(){ scanWifi(); });"
         "</script></head><body>"
         "<div class='card'>"
         "<h1>VN2511 WiFi Config</h1>"
@@ -454,14 +465,31 @@ esp_err_t provision_service_start(void)
 
 esp_err_t provision_service_stop(void)
 {
+    ESP_LOGW(TAG,
+             "provision_service_stop running=%d httpd=%p",
+             s_running,
+             s_httpd);
+
     stop_http_if_running();
+
     s_running = false;
 
+    /*
+     * Stop Wi-Fi driver để xóa sạch trạng thái AP/STA cũ.
+     * Không dùng s_softap_started vì project hiện tại không có biến này.
+     */
     esp_err_t err = esp_wifi_stop();
     if (err == ESP_ERR_WIFI_NOT_INIT || err == ESP_ERR_WIFI_STOP_STATE) {
         return ESP_OK;
     }
-    return err;
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_stop in provision_service_stop failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
 }
 
 bool provision_service_is_running(void)

@@ -10,7 +10,7 @@ extern "C" {
 esp_err_t provision_service_start(void);
 esp_err_t provision_service_stop(void);
 bool provision_service_is_running(void);
-
+esp_err_t provision_service_restart(void);
 #ifdef __cplusplus
 }
 #endif
